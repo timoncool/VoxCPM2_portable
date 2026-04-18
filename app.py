@@ -309,6 +309,10 @@ def _build_kwargs(
     steps: int,
     normalize: bool,
     retry: bool,
+    retry_max: int = 3,
+    retry_ratio: float = 6.0,
+    min_len: int = 2,
+    max_len: int = 4096,
     reference_wav_path: Optional[str] = None,
     prompt_wav_path: Optional[str] = None,
     prompt_text: Optional[str] = None,
@@ -320,6 +324,10 @@ def _build_kwargs(
         "inference_timesteps": int(steps),
         "normalize": bool(normalize),
         "retry_badcase": bool(retry),
+        "retry_badcase_max_times": int(retry_max),
+        "retry_badcase_ratio_threshold": float(retry_ratio),
+        "min_len": int(min_len),
+        "max_len": int(max_len),
     }
     if reference_wav_path:
         kwargs["reference_wav_path"] = reference_wav_path
@@ -327,13 +335,13 @@ def _build_kwargs(
         kwargs["prompt_wav_path"] = prompt_wav_path
     if prompt_text:
         kwargs["prompt_text"] = prompt_text
-    if denoise is not None and reference_wav_path is not None:
+    if denoise is not None and (reference_wav_path or prompt_wav_path):
         kwargs["denoise"] = bool(denoise)
     return kwargs
 
 
 # === Функции генерации ===
-def tts_generate(text, cfg, steps, fmt, seed, locked, normalize, retry):
+def tts_generate(text, cfg, steps, fmt, retry_max, retry_ratio, min_len, max_len, seed, locked, normalize, retry):
     if not (text or "").strip():
         raise gr.Error("Введите текст / Please enter text.")
     try:
@@ -342,6 +350,8 @@ def tts_generate(text, cfg, steps, fmt, seed, locked, normalize, retry):
         kwargs = _build_kwargs(
             text=text.strip(), cfg=cfg, steps=steps,
             normalize=normalize, retry=retry,
+            retry_max=retry_max, retry_ratio=retry_ratio,
+            min_len=min_len, max_len=max_len,
         )
         wav = _collect_audio(model.generate(**kwargs))
         return _save_wav(wav, model.tts_model.sample_rate, "tts", fmt), used_seed
@@ -352,7 +362,7 @@ def tts_generate(text, cfg, steps, fmt, seed, locked, normalize, retry):
         raise gr.Error(f"Ошибка генерации / Generation error: {e}") from e
 
 
-def voice_design(description, text, cfg, steps, fmt, seed, locked, normalize, retry):
+def voice_design(description, text, cfg, steps, fmt, retry_max, retry_ratio, min_len, max_len, seed, locked, normalize, retry):
     if not (text or "").strip():
         raise gr.Error("Введите текст / Please enter text.")
     if not (description or "").strip():
@@ -364,6 +374,8 @@ def voice_design(description, text, cfg, steps, fmt, seed, locked, normalize, re
         kwargs = _build_kwargs(
             text=combined, cfg=cfg, steps=steps,
             normalize=normalize, retry=retry,
+            retry_max=retry_max, retry_ratio=retry_ratio,
+            min_len=min_len, max_len=max_len,
         )
         wav = _collect_audio(model.generate(**kwargs))
         return _save_wav(wav, model.tts_model.sample_rate, "design", fmt), used_seed
@@ -388,7 +400,7 @@ def _numpy_to_tempfile(ref_audio):
     return tmp.name
 
 
-def voice_clone(text, ref_audio, style, transcript, cfg, steps, fmt, seed, locked, normalize, denoise, retry):
+def voice_clone(text, ref_audio, style, transcript, cfg, steps, fmt, retry_max, retry_ratio, min_len, max_len, seed, locked, normalize, denoise, retry):
     """Voice Cloning. Если transcript заполнен — автоматически Ultimate-режим."""
     if not (text or "").strip():
         raise gr.Error("Введите текст / Please enter text.")
@@ -403,51 +415,26 @@ def voice_clone(text, ref_audio, style, transcript, cfg, steps, fmt, seed, locke
         used_seed = _resolve_seed(seed, locked)
 
         transcript_clean = (transcript or "").strip()
+        common_kwargs = dict(
+            text=final_text, cfg=cfg, steps=steps,
+            normalize=normalize, retry=retry,
+            retry_max=retry_max, retry_ratio=retry_ratio,
+            min_len=min_len, max_len=max_len,
+            denoise=denoise,
+        )
         if transcript_clean:
-            # Ultimate-режим: prompt_wav + prompt_text + reference
             kwargs = _build_kwargs(
-                text=final_text, cfg=cfg, steps=steps,
-                normalize=normalize, retry=retry,
+                **common_kwargs,
                 prompt_wav_path=ref_audio, prompt_text=transcript_clean,
-                reference_wav_path=ref_audio, denoise=denoise,
+                reference_wav_path=ref_audio,
             )
         else:
-            # Обычный reference-режим
             kwargs = _build_kwargs(
-                text=final_text, cfg=cfg, steps=steps,
-                normalize=normalize, retry=retry,
-                reference_wav_path=ref_audio, denoise=denoise,
+                **common_kwargs,
+                reference_wav_path=ref_audio,
             )
         wav = _collect_audio(model.generate(**kwargs))
         return _save_wav(wav, model.tts_model.sample_rate, "clone", fmt), used_seed
-    except gr.Error:
-        raise
-    except Exception as e:
-        traceback.print_exc()
-        raise gr.Error(f"Ошибка генерации / Generation error: {e}") from e
-
-
-def ultimate_clone(text, ref_audio, transcript, cfg, steps, seed, locked, normalize, denoise, retry):
-    if not (text or "").strip():
-        raise gr.Error("Введите текст / Please enter text.")
-    if ref_audio is None:
-        raise gr.Error("Загрузите референс-аудио / Please upload reference audio.")
-    if not (transcript or "").strip():
-        raise gr.Error("Введите транскрипт референса / Please enter reference transcript.")
-    ref_audio = _numpy_to_tempfile(ref_audio)
-    try:
-        model = get_model()
-        used_seed = _resolve_seed(seed, locked)
-        kwargs = _build_kwargs(
-            text=text.strip(), cfg=cfg, steps=steps,
-            normalize=normalize, retry=retry,
-            prompt_wav_path=ref_audio,
-            prompt_text=transcript.strip(),
-            reference_wav_path=ref_audio,
-            denoise=denoise,
-        )
-        wav = _collect_audio(model.generate(**kwargs))
-        return _save_wav(wav, model.tts_model.sample_rate, "ultimate"), used_seed
     except gr.Error:
         raise
     except Exception as e:
@@ -617,13 +604,19 @@ def _advanced_block(prefix: str, show_denoise: bool = False):
         with gr.Row():
             cfg = gr.Slider(0.5, 5.0, value=2.0, step=0.1, label=I18N("label_cfg"), info="Выше = ближе к промпту, ниже = больше креатива", elem_id=f"{prefix}_cfg")
             steps = gr.Slider(5, 30, value=10, step=1, label=I18N("label_steps"), info="Больше = качественнее, но медленнее (5-10 для скорости)", elem_id=f"{prefix}_steps")
+        with gr.Row():
+            min_len = gr.Slider(1, 100, value=2, step=1, label=I18N("label_min_len"), info="Минимальная длина аудио (токенов)", elem_id=f"{prefix}_min_len")
+            max_len = gr.Slider(512, 8192, value=4096, step=256, label=I18N("label_max_len"), info="Максимальная длина генерации", elem_id=f"{prefix}_max_len")
         fmt = gr.Radio(choices=["mp3", "wav", "flac", "ogg"], value="mp3", label=I18N("label_format"), elem_id=f"{prefix}_fmt")
         normalize = gr.Checkbox(value=True, label=I18N("label_normalize"), info="Обработка чисел, дат, сокращений", elem_id=f"{prefix}_normalize")
         retry = gr.Checkbox(value=False, label=I18N("label_retry"), info="Перегенерировать если качество плохое", elem_id=f"{prefix}_retry")
+        with gr.Row():
+            retry_max = gr.Slider(1, 10, value=3, step=1, label=I18N("label_retry_max"), info="Макс. число попыток повтора", elem_id=f"{prefix}_retry_max")
+            retry_ratio = gr.Slider(2.0, 20.0, value=6.0, step=0.5, label=I18N("label_retry_ratio"), info="Порог детекции плохой генерации", elem_id=f"{prefix}_retry_ratio")
         denoise = None
         if show_denoise:
             denoise = gr.Checkbox(value=False, label=I18N("label_denoise"), info="ZipEnhancer денойзинг референс-аудио", elem_id=f"{prefix}_denoise")
-    return cfg, steps, fmt, normalize, retry, denoise
+    return cfg, steps, fmt, normalize, retry, retry_max, retry_ratio, min_len, max_len, denoise
 
 
 # === i18n — официальный паттерн Gradio 6 ===
@@ -668,6 +661,10 @@ I18N = gr.I18n(
         "brand_header_html": _BRAND_HTML_EN,
         "transcript_info": "Fill in to enable Ultimate mode (max fidelity). Auto-fills from voice pack.",
         "label_format": "Output format",
+        "label_min_len": "Min audio length",
+        "label_max_len": "Max generation length",
+        "label_retry_max": "Max retry attempts",
+        "label_retry_ratio": "Bad-case ratio threshold",
     },
     ru={
         "tab_tts": "Текст в речь",
@@ -708,6 +705,10 @@ I18N = gr.I18n(
         "brand_header_html": _BRAND_HTML_RU,
         "transcript_info": "Заполните для Ultimate-режима (макс. качество). Автозаполняется из пака.",
         "label_format": "Формат вывода",
+        "label_min_len": "Мин. длина аудио",
+        "label_max_len": "Макс. длина генерации",
+        "label_retry_max": "Макс. попыток повтора",
+        "label_retry_ratio": "Порог плохой генерации",
     },
 )
 
@@ -744,7 +745,7 @@ def build_ui():
             with gr.Row(equal_height=False):
                 with gr.Column(scale=1):
                     tts_text = gr.Textbox(label=I18N("label_text"), placeholder="Введите текст на любом из 30 поддерживаемых языков...", lines=4)
-                    tts_cfg, tts_steps, tts_fmt, tts_norm, tts_retry, _ = _advanced_block("tts", show_denoise=False)
+                    tts_cfg, tts_steps, tts_fmt, tts_norm, tts_retry, tts_retry_max, tts_retry_ratio, tts_min_len, tts_max_len, _ = _advanced_block("tts", show_denoise=False)
                     tts_seed, tts_locked = _seed_row("tts")
                     tts_btn = gr.Button(I18N("btn_tts"), variant="primary", size="lg")
                 with gr.Column(scale=1):
@@ -752,7 +753,7 @@ def build_ui():
             gr.Examples(examples=TTS_EXAMPLES, inputs=[tts_text], label="Примеры / Examples", examples_per_page=10)
             tts_btn.click(
                 tts_generate,
-                inputs=[tts_text, tts_cfg, tts_steps, tts_fmt, tts_seed, tts_locked, tts_norm, tts_retry],
+                inputs=[tts_text, tts_cfg, tts_steps, tts_fmt, tts_retry_max, tts_retry_ratio, tts_min_len, tts_max_len, tts_seed, tts_locked, tts_norm, tts_retry],
                 outputs=[tts_out, tts_seed],
             )
 
@@ -763,7 +764,7 @@ def build_ui():
                 with gr.Column(scale=1):
                     vd_desc = gr.Textbox(label=I18N("label_description"), placeholder="например: Молодая женщина, нежный и мягкий голос", lines=2)
                     vd_text = gr.Textbox(label=I18N("label_content"), placeholder="Привет, добро пожаловать в VoxCPM2!", lines=3)
-                    vd_cfg, vd_steps, vd_fmt, vd_norm, vd_retry, _ = _advanced_block("vd", show_denoise=False)
+                    vd_cfg, vd_steps, vd_fmt, vd_norm, vd_retry, vd_retry_max, vd_retry_ratio, vd_min_len, vd_max_len, _ = _advanced_block("vd", show_denoise=False)
                     vd_seed, vd_locked = _seed_row("vd")
                     vd_btn = gr.Button(I18N("btn_design"), variant="primary", size="lg")
                 with gr.Column(scale=1):
@@ -780,7 +781,7 @@ def build_ui():
                     )
             vd_btn.click(
                 voice_design,
-                inputs=[vd_desc, vd_text, vd_cfg, vd_steps, vd_fmt, vd_seed, vd_locked, vd_norm, vd_retry],
+                inputs=[vd_desc, vd_text, vd_cfg, vd_steps, vd_fmt, vd_retry_max, vd_retry_ratio, vd_min_len, vd_max_len, vd_seed, vd_locked, vd_norm, vd_retry],
                 outputs=[vd_out, vd_seed],
             )
 
@@ -821,7 +822,7 @@ def build_ui():
                         lines=1,
                         elem_id="vc_style",
                     )
-                    vc_cfg, vc_steps, vc_fmt, vc_norm, vc_retry, vc_denoise = _advanced_block("vc", show_denoise=True)
+                    vc_cfg, vc_steps, vc_fmt, vc_norm, vc_retry, vc_retry_max, vc_retry_ratio, vc_min_len, vc_max_len, vc_denoise = _advanced_block("vc", show_denoise=True)
                     vc_seed, vc_locked = _seed_row("vc")
                     vc_btn = gr.Button(I18N("btn_clone"), variant="primary", size="lg", elem_id="vc_btn")
                 with gr.Column(scale=1):
@@ -846,7 +847,7 @@ def build_ui():
 
             vc_btn.click(
                 voice_clone,
-                inputs=[vc_text, vc_ref, vc_style, vc_transcript, vc_cfg, vc_steps, vc_fmt, vc_seed, vc_locked, vc_norm, vc_denoise, vc_retry],
+                inputs=[vc_text, vc_ref, vc_style, vc_transcript, vc_cfg, vc_steps, vc_fmt, vc_retry_max, vc_retry_ratio, vc_min_len, vc_max_len, vc_seed, vc_locked, vc_norm, vc_denoise, vc_retry],
                 outputs=[vc_out, vc_seed],
             )
 
