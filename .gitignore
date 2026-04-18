@@ -7,6 +7,12 @@ downloads/
 ffmpeg/
 voices/
 cuda_version.txt
+install_log.txt
+run_log.txt
+_input.txt
+_test_install.bat
+_auto_install.bat
+install_err.txt
 
 __pycache__/
 *.pyc

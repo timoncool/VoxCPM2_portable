@@ -1,3 +1,0 @@
-[VoxCPM2] Device: NVIDIA GeForce RTX 4090 | VRAM: 25.8 GB
-* Running on local URL:  http://127.0.0.1:7860
-* To create a public link, set `share=True` in `launch()`.
