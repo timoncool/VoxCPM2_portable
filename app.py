@@ -866,27 +866,37 @@ def _seed_row(prefix: str):
 def _advanced_block(prefix: str, show_denoise: bool = False):
     """Accordion с расширенными параметрами."""
     with gr.Accordion(label=I18N("label_advanced"), open=False, elem_id=f"{prefix}_advanced"):
-        # LoRA — просто dropdown. '-- Без LoRA --' = detach. Любое другое = attach.
-        _LORA_NONE = "-- Без LoRA --"
-        _lora_choices = [_LORA_NONE] + scan_local_loras()
+        # LoRA: галочка = on/off, dropdown всегда видим
+        _lora_choices = scan_local_loras()
+        use_lora = gr.Checkbox(
+            value=bool(_ACTIVE_LORA),
+            label="🧬 Использовать LoRA",
+            info="Fine-tuned веса из папки lora/",
+            elem_id=f"{prefix}_use_lora",
+        )
         with gr.Row():
             lora_sel = gr.Dropdown(
-                label="🧬 LoRA (fine-tuned веса из папки lora/)",
-                choices=_lora_choices,
-                value=_ACTIVE_LORA if _ACTIVE_LORA in _lora_choices else _LORA_NONE,
+                label="LoRA",
+                choices=_lora_choices if _lora_choices else ["(нет обученных)"],
+                value=(_ACTIVE_LORA if _ACTIVE_LORA in _lora_choices else (_lora_choices[0] if _lora_choices else None)),
                 interactive=True, scale=4, elem_id=f"{prefix}_lora",
             )
             lora_refresh = gr.Button("🔄", size="sm", scale=0, elem_id=f"{prefix}_lora_refresh")
 
-        def _on_lora_change(name):
-            if not name or name == _LORA_NONE:
+        def _on_use_lora(enabled, name):
+            if not enabled:
                 lora_detach()
-            else:
+            elif name and name != "(нет обученных)":
                 lora_attach(name)
 
-        lora_sel.change(_on_lora_change, inputs=[lora_sel], outputs=[], show_progress="hidden")
+        def _on_pick(name, enabled):
+            if enabled and name and name != "(нет обученных)":
+                lora_attach(name)
+
+        use_lora.change(_on_use_lora, inputs=[use_lora, lora_sel], outputs=[], show_progress="hidden")
+        lora_sel.change(_on_pick, inputs=[lora_sel, use_lora], outputs=[], show_progress="hidden")
         lora_refresh.click(
-            fn=lambda: gr.update(choices=[_LORA_NONE] + scan_local_loras()),
+            fn=lambda: gr.update(choices=scan_local_loras() or ["(нет обученных)"]),
             outputs=[lora_sel],
         )
         with gr.Row():
