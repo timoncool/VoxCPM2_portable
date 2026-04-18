@@ -6,6 +6,9 @@ output/
 downloads/
 ffmpeg/
 voices/
+lora/
+train_data/
+VoxCPM_repo/
 cuda_version.txt
 install_log.txt
 run_log.txt

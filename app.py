@@ -85,8 +85,13 @@ from voxcpm import VoxCPM
 SCRIPT_DIR = Path(__file__).parent.absolute()
 OUTPUT_DIR = SCRIPT_DIR / "output"
 VOICES_DIR = SCRIPT_DIR / "voices"
+LORA_DIR = SCRIPT_DIR / "lora"
+TRAIN_DATA_DIR = SCRIPT_DIR / "train_data"
+VOXCPM_REPO_DIR = SCRIPT_DIR / "VoxCPM_repo"  # для train script
 OUTPUT_DIR.mkdir(exist_ok=True)
 VOICES_DIR.mkdir(exist_ok=True)
+LORA_DIR.mkdir(exist_ok=True)
+TRAIN_DATA_DIR.mkdir(exist_ok=True)
 
 MODEL_REF = "openbmb/VoxCPM2"
 
@@ -189,6 +194,236 @@ def load_cloud_list():
         "Не удалось загрузить список голосов.",
         gr.update(choices=[], value=[]),
     )
+
+
+# ====================================================================
+# === LoRA: fine-tuning + hot-swap ===
+# ====================================================================
+
+_ACTIVE_LORA: Optional[str] = None  # имя загруженной LoRA или None
+
+
+def scan_local_loras() -> list[str]:
+    """Список локальных LoRA чекпоинтов в lora/ (по наличию lora_config.json)."""
+    result = []
+    for p in LORA_DIR.iterdir():
+        if p.is_dir() and (p / "lora_config.json").exists():
+            result.append(p.name)
+    # также checkpoint-папки внутри step_XXXX
+    for p in LORA_DIR.iterdir():
+        if p.is_dir():
+            for sub in p.iterdir():
+                if sub.is_dir() and (sub / "lora_config.json").exists():
+                    result.append(f"{p.name}/{sub.name}")
+    return sorted(set(result))
+
+
+def lora_attach(name: str) -> str:
+    """Подключить LoRA к загруженной модели (hot-swap)."""
+    global _ACTIVE_LORA
+    if not name or name == "-- Без LoRA --":
+        return lora_detach()
+    path = LORA_DIR / name
+    if not path.exists() or not (path / "lora_config.json").exists():
+        return f"❌ LoRA '{name}' не найдена или повреждена (нет lora_config.json)"
+    try:
+        model = get_model()
+        try:
+            model.unload_lora()
+        except Exception:
+            pass
+        model.load_lora(str(path))
+        model.set_lora_enabled(True)
+        _ACTIVE_LORA = name
+        return f"✅ LoRA '{name}' загружена и активна"
+    except Exception as exc:
+        traceback.print_exc()
+        return f"❌ Ошибка загрузки LoRA: {exc}"
+
+
+def lora_detach() -> str:
+    """Отключить активную LoRA."""
+    global _ACTIVE_LORA
+    try:
+        if _ACTIVE_LORA:
+            model = get_model()
+            try:
+                model.set_lora_enabled(False)
+                model.unload_lora()
+            except Exception as e:
+                print(f"[lora] detach warning: {e}")
+        _ACTIVE_LORA = None
+        return "LoRA отключена"
+    except Exception as exc:
+        return f"Ошибка отключения: {exc}"
+
+
+def lora_active_status() -> str:
+    return f"Активна: {_ACTIVE_LORA}" if _ACTIVE_LORA else "LoRA не активна"
+
+
+def ensure_voxcpm_repo() -> Optional[Path]:
+    """Клонирует OpenBMB/VoxCPM если нет — нужно для train_voxcpm_finetune.py."""
+    if VOXCPM_REPO_DIR.exists() and (VOXCPM_REPO_DIR / "scripts" / "train_voxcpm_finetune.py").exists():
+        return VOXCPM_REPO_DIR
+    import subprocess
+    try:
+        print(f"[lora] cloning OpenBMB/VoxCPM → {VOXCPM_REPO_DIR}")
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "https://github.com/OpenBMB/VoxCPM.git", str(VOXCPM_REPO_DIR)],
+            check=True, capture_output=True, timeout=180,
+        )
+        return VOXCPM_REPO_DIR
+    except Exception as exc:
+        print(f"[lora] clone failed: {exc}")
+        return None
+
+
+def prepare_train_data(name: str, files: list, transcripts_text: str) -> tuple[Path, int]:
+    """
+    Подготовить датасет для обучения:
+    - files: список временных путей к wav/mp3/flac из gr.File
+    - transcripts_text: построчно — имя_файла|транскрипт
+    Возвращает (путь_к_manifest.jsonl, количество_сэмплов)
+    """
+    import json, shutil
+    ds_dir = TRAIN_DATA_DIR / name
+    ds_dir.mkdir(parents=True, exist_ok=True)
+    audio_dir = ds_dir / "audio"
+    audio_dir.mkdir(exist_ok=True)
+
+    # Map transcript_text "filename.wav|текст"
+    tr_map = {}
+    for line in (transcripts_text or "").splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        fn, tx = line.split("|", 1)
+        tr_map[fn.strip()] = tx.strip()
+
+    manifest = []
+    for src in files or []:
+        src = Path(src)
+        if not src.exists():
+            continue
+        dst = audio_dir / src.name
+        if not dst.exists():
+            shutil.copy2(str(src), str(dst))
+        tx = tr_map.get(src.name) or tr_map.get(src.stem) or ""
+        if not tx:
+            continue  # без транскрипта пропускаем
+        manifest.append({"audio_filepath": str(dst), "text": tx})
+
+    manifest_path = ds_dir / "train.jsonl"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        for it in manifest:
+            f.write(json.dumps(it, ensure_ascii=False) + "\n")
+    return manifest_path, len(manifest)
+
+
+def train_lora(name, files, transcripts, r, alpha, steps, lr, progress=gr.Progress()):
+    """Запустить обучение LoRA. Yield-генератор для live log."""
+    import subprocess, yaml, json
+    if not name or not name.strip():
+        yield "❌ Укажи имя LoRA (имя папки-результата)"
+        return
+    name = name.strip().replace(" ", "_")
+
+    if not files:
+        yield "❌ Загрузите аудио-файлы для тренировки"
+        return
+
+    progress(0.05, desc="Клонирую VoxCPM repo (если нужен)...")
+    repo = ensure_voxcpm_repo()
+    if repo is None:
+        yield "❌ Не удалось скачать OpenBMB/VoxCPM (нужен git + интернет)"
+        return
+
+    progress(0.1, desc="Готовлю датасет...")
+    manifest, n = prepare_train_data(name, files, transcripts)
+    if n == 0:
+        yield "❌ Нет валидных сэмплов. Проверь транскрипты (формат: имя_файла.wav|текст)"
+        return
+    yield f"✓ Dataset: {n} сэмплов → {manifest}"
+
+    save_path = LORA_DIR / name
+    save_path.mkdir(exist_ok=True)
+    config_path = TRAIN_DATA_DIR / name / "train_config.yaml"
+
+    # Путь к уже скачанному VoxCPM2 (в models/ через HF cache)
+    # Ищем snapshot
+    from huggingface_hub import snapshot_download
+    try:
+        pretrained = snapshot_download("openbmb/VoxCPM2", local_files_only=True)
+    except Exception:
+        pretrained = snapshot_download("openbmb/VoxCPM2")
+
+    cfg = {
+        "pretrained_path": pretrained,
+        "train_manifest": str(manifest),
+        "sample_rate": 16000,  # AudioVAE encodes 16kHz (issue #202 fix)
+        "out_sample_rate": 48000,
+        "batch_size": 1,
+        "grad_accum_steps": 16,
+        "num_workers": 0,
+        "num_iters": int(steps),
+        "log_interval": 10,
+        "valid_interval": max(100, int(steps) // 2),
+        "save_interval": max(100, int(steps) // 2),
+        "learning_rate": float(lr),
+        "weight_decay": 0.01,
+        "warmup_steps": min(100, int(steps) // 10),
+        "max_steps": int(steps),
+        "max_batch_tokens": 8192,
+        "save_path": str(save_path),
+        "lambdas": {"loss/diff": 1.0, "loss/stop": 1.0},
+        "lora": {
+            "enable_lm": True,
+            "enable_dit": True,
+            "enable_proj": False,
+            "r": int(r),
+            "alpha": int(alpha),
+            "dropout": 0.0,
+        },
+    }
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, allow_unicode=True)
+    yield f"✓ Config: {config_path}"
+    yield f"Запуск тренировки (steps={steps}, r={r}, α={alpha}, lr={lr})..."
+
+    progress(0.15, desc="Старт тренировки...")
+
+    train_script = repo / "scripts" / "train_voxcpm_finetune.py"
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    proc = subprocess.Popen(
+        [sys.executable, str(train_script), "--config_path", str(config_path)],
+        cwd=str(repo),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        env=env, text=True, encoding="utf-8", errors="replace", bufsize=1,
+    )
+    log_lines = []
+    try:
+        for line in proc.stdout:
+            line = line.rstrip()
+            log_lines.append(line)
+            # Парсим прогресс из логов (iter XX/YYY)
+            import re
+            m = re.search(r'iter[:\s]+(\d+)\s*/\s*(\d+)', line, re.I) or re.search(r'step[:\s]+(\d+)\s*/\s*(\d+)', line, re.I)
+            if m:
+                cur, total = int(m.group(1)), int(m.group(2))
+                progress(0.15 + 0.8 * cur / max(total, 1), desc=f"Step {cur}/{total}")
+            # yield последние 40 строк как log
+            yield "\n".join(log_lines[-40:])
+    except Exception as exc:
+        log_lines.append(f"[exception] {exc}")
+        yield "\n".join(log_lines[-40:])
+    proc.wait()
+    if proc.returncode == 0:
+        progress(1.0, desc="Готово")
+        log_lines.append(f"\n✅ Готово! LoRA сохранена в {save_path}")
+    else:
+        log_lines.append(f"\n❌ Тренировка завершилась с кодом {proc.returncode}")
+    yield "\n".join(log_lines[-60:])
 
 
 def download_selected_voices(selected):
@@ -690,6 +925,9 @@ I18N = gr.I18n(
         "label_retry_max": "Max retry attempts",
         "label_retry_ratio": "Bad-case ratio threshold",
         "label_streaming": "Streaming mode (live progress)",
+        "tab_lora": "LoRA",
+        "lora_attach_title": "🔌 Attach trained LoRA",
+        "lora_train_title": "🎓 Train new LoRA",
     },
     ru={
         "tab_tts": "Текст в речь",
@@ -735,6 +973,9 @@ I18N = gr.I18n(
         "label_retry_max": "Макс. попыток повтора",
         "label_retry_ratio": "Порог плохой генерации",
         "label_streaming": "Потоковая генерация (live)",
+        "tab_lora": "LoRA",
+        "lora_attach_title": "🔌 Подключить готовую LoRA",
+        "lora_train_title": "🎓 Обучить новую LoRA",
     },
 )
 
@@ -893,6 +1134,68 @@ def build_ui():
             vc_refresh_btn.click(_vc_refresh, outputs=[vc_voice_pick])
             vc_load_cloud_btn.click(load_cloud_list, outputs=[vc_cloud_status, vc_cloud_voices])
             vc_download_btn.click(download_selected_voices, inputs=[vc_cloud_voices], outputs=[vc_download_status, vc_voice_pick])
+
+        # === Таб 4: LoRA ===
+        with gr.Tab(label=I18N("tab_lora")):
+            # --- Attach ---
+            gr.Markdown(f"### {I18N('lora_attach_title')}")
+            with gr.Row():
+                with gr.Column(scale=2):
+                    lora_pick = gr.Dropdown(
+                        label="LoRA из папки lora/",
+                        choices=["-- Без LoRA --"] + scan_local_loras(),
+                        value="-- Без LoRA --",
+                        interactive=True,
+                    )
+                    with gr.Row():
+                        lora_attach_btn = gr.Button("Подключить", variant="primary")
+                        lora_detach_btn = gr.Button("Отключить", variant="secondary")
+                        lora_refresh_btn = gr.Button("🔄", size="sm", scale=0)
+                    lora_status = gr.Textbox(label="Статус", interactive=False, value=lora_active_status())
+            gr.Markdown("---")
+
+            # --- Train ---
+            gr.Markdown(f"### {I18N('lora_train_title')}")
+            gr.Markdown(
+                "**Как подготовить датасет:** загрузите 5-50 аудио (wav/mp3/flac, 3-15 сек каждое), "
+                "ниже в поле транскриптов построчно: `имя_файла.wav|точный текст`.\n\n"
+                "**Минимум**: 5-10 минут аудио. Оптимально — чистая запись одного голоса."
+            )
+            lora_name = gr.Textbox(label="Имя LoRA (папка-результат)", placeholder="my_voice_v1", value="")
+            lora_files = gr.Files(
+                label="Аудиофайлы (wav/mp3/flac/m4a)",
+                file_types=[".wav", ".mp3", ".flac", ".m4a", ".ogg"],
+                file_count="multiple",
+            )
+            lora_transcripts = gr.Textbox(
+                label="Транскрипты (формат: имя_файла|текст)",
+                placeholder="clip_001.wav|Здравствуйте, меня зовут Иван.\nclip_002.wav|Сегодня отличная погода.",
+                lines=8,
+            )
+            with gr.Row():
+                lora_r = gr.Slider(8, 128, value=32, step=8, label="LoRA rank (r)", info="Больше = больше capacity")
+                lora_alpha = gr.Slider(8, 128, value=32, step=8, label="LoRA alpha")
+            with gr.Row():
+                lora_steps = gr.Slider(100, 5000, value=1000, step=100, label="Training steps")
+                lora_lr = gr.Slider(0.00001, 0.001, value=0.0001, step=0.00001, label="Learning rate")
+            lora_train_btn = gr.Button("🎓 Начать обучение", variant="primary", size="lg")
+            lora_train_log = gr.Textbox(label="Лог тренировки", interactive=False, lines=15)
+
+            # Handlers
+            lora_attach_btn.click(lora_attach, inputs=[lora_pick], outputs=[lora_status])
+            lora_detach_btn.click(lora_detach, outputs=[lora_status])
+            lora_refresh_btn.click(
+                fn=lambda: gr.update(choices=["-- Без LoRA --"] + scan_local_loras()),
+                outputs=[lora_pick],
+            )
+            lora_train_btn.click(
+                train_lora,
+                inputs=[lora_name, lora_files, lora_transcripts, lora_r, lora_alpha, lora_steps, lora_lr],
+                outputs=[lora_train_log],
+            ).then(
+                fn=lambda: gr.update(choices=["-- Без LoRA --"] + scan_local_loras()),
+                outputs=[lora_pick],
+            )
 
     return demo
 
