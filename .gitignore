@@ -1,0 +1,17 @@
+python/
+models/
+cache/
+temp/
+output/
+downloads/
+ffmpeg/
+cuda_version.txt
+
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.idea/
+.vscode/
+*.log

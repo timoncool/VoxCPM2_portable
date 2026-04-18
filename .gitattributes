@@ -1,0 +1,6 @@
+*.bat eol=crlf
+*.cmd eol=crlf
+*.ps1 eol=crlf
+*.py eol=lf
+*.md eol=lf
+*.txt eol=lf

@@ -1,0 +1,5 @@
+voxcpm
+gradio>=6,<7
+soundfile>=0.13.1
+numpy>=1.21.0
+huggingface_hub[hf_xet]
