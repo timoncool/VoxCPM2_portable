@@ -866,30 +866,23 @@ def _seed_row(prefix: str):
 def _advanced_block(prefix: str, show_denoise: bool = False):
     """Accordion с расширенными параметрами."""
     with gr.Accordion(label=I18N("label_advanced"), open=False, elem_id=f"{prefix}_advanced"):
-        _loras = scan_local_loras()
-        use_lora = gr.Checkbox(
-            value=bool(_ACTIVE_LORA),
-            label="🧬 Использовать LoRA",
-            elem_id=f"{prefix}_use_lora",
-        )
-        lora_sel = gr.Dropdown(
-            label="LoRA",
-            choices=_loras if _loras else ["(нет обученных — обучи в табе LoRA)"],
-            value=_ACTIVE_LORA if _ACTIVE_LORA in _loras else (_loras[0] if _loras else None),
-            interactive=True,
-            visible=bool(_ACTIVE_LORA),
-            elem_id=f"{prefix}_lora",
-        )
+        _NONE = "-- Без LoRA --"
+        _choices = [_NONE] + scan_local_loras()
+        with gr.Row():
+            lora_sel = gr.Dropdown(
+                label="🧬 LoRA", choices=_choices,
+                value=(_ACTIVE_LORA if _ACTIVE_LORA in _choices else _NONE),
+                interactive=True, scale=4, elem_id=f"{prefix}_lora",
+            )
+            lora_refresh = gr.Button("🔄", size="sm", scale=0, elem_id=f"{prefix}_lora_refresh")
 
-        # checkbox → только visible (один output, без choices)
-        use_lora.change(
-            fn=lambda enabled, name: (gr.update(visible=enabled), lora_attach(name) if enabled and name and "нет обученных" not in str(name) else lora_detach())[0],
-            inputs=[use_lora, lora_sel], outputs=[lora_sel], show_progress="hidden",
-        )
-        # dropdown → attach если включена галочка
         lora_sel.change(
-            fn=lambda n, en: lora_attach(n) if en and n and "нет обученных" not in str(n) else None,
-            inputs=[lora_sel, use_lora], outputs=[], show_progress="hidden",
+            fn=lambda n: lora_detach() if n == _NONE else lora_attach(n),
+            inputs=[lora_sel], outputs=[], show_progress="hidden",
+        )
+        lora_refresh.click(
+            fn=lambda: gr.update(choices=[_NONE] + scan_local_loras()),
+            outputs=[lora_sel],
         )
         with gr.Row():
             cfg = gr.Slider(0.5, 5.0, value=2.0, step=0.1, label=I18N("label_cfg"), info="Выше = ближе к промпту, ниже = больше креатива", elem_id=f"{prefix}_cfg")
