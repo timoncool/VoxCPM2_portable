@@ -811,11 +811,12 @@ button.primary {
 }
 .lora-refresh-btn {
   max-width: 44px !important; flex: 0 0 44px !important;
-  align-self: flex-end !important;
+  margin-top: 22px !important;  /* выравнивание с полем dropdown (под label) */
 }
 .lora-refresh-btn button {
   padding: 0 !important; min-width: 0 !important;
   height: 44px !important; max-height: 44px !important;
+  width: 44px !important;
 }
 """
 
