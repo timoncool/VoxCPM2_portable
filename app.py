@@ -87,7 +87,7 @@ OUTPUT_DIR = SCRIPT_DIR / "output"
 VOICES_DIR = SCRIPT_DIR / "voices"
 LORA_DIR = SCRIPT_DIR / "lora"
 TRAIN_DATA_DIR = SCRIPT_DIR / "train_data"
-VOXCPM_REPO_DIR = SCRIPT_DIR / "VoxCPM_repo"  # для train script
+TRAINING_DIR = SCRIPT_DIR / "training"  # bundled train scripts (in repo)
 OUTPUT_DIR.mkdir(exist_ok=True)
 VOICES_DIR.mkdir(exist_ok=True)
 LORA_DIR.mkdir(exist_ok=True)
@@ -262,21 +262,10 @@ def lora_active_status() -> str:
     return f"Активна: {_ACTIVE_LORA}" if _ACTIVE_LORA else "LoRA не активна"
 
 
-def ensure_voxcpm_repo() -> Optional[Path]:
-    """Клонирует OpenBMB/VoxCPM если нет — нужно для train_voxcpm_finetune.py."""
-    if VOXCPM_REPO_DIR.exists() and (VOXCPM_REPO_DIR / "scripts" / "train_voxcpm_finetune.py").exists():
-        return VOXCPM_REPO_DIR
-    import subprocess
-    try:
-        print(f"[lora] cloning OpenBMB/VoxCPM → {VOXCPM_REPO_DIR}")
-        subprocess.run(
-            ["git", "clone", "--depth", "1", "https://github.com/OpenBMB/VoxCPM.git", str(VOXCPM_REPO_DIR)],
-            check=True, capture_output=True, timeout=180,
-        )
-        return VOXCPM_REPO_DIR
-    except Exception as exc:
-        print(f"[lora] clone failed: {exc}")
-        return None
+def get_training_script() -> Optional[Path]:
+    """Возвращает путь к bundled train script."""
+    script = TRAINING_DIR / "scripts" / "train_voxcpm_finetune.py"
+    return script if script.exists() else None
 
 
 def prepare_train_data(name: str, files: list, transcripts_text: str) -> tuple[Path, int]:
@@ -333,10 +322,9 @@ def train_lora(name, files, transcripts, r, alpha, steps, lr, progress=gr.Progre
         yield "❌ Загрузите аудио-файлы для тренировки"
         return
 
-    progress(0.05, desc="Клонирую VoxCPM repo (если нужен)...")
-    repo = ensure_voxcpm_repo()
-    if repo is None:
-        yield "❌ Не удалось скачать OpenBMB/VoxCPM (нужен git + интернет)"
+    train_script = get_training_script()
+    if train_script is None:
+        yield "❌ training/scripts/train_voxcpm_finetune.py не найден"
         return
 
     progress(0.1, desc="Готовлю датасет...")
@@ -393,11 +381,10 @@ def train_lora(name, files, transcripts, r, alpha, steps, lr, progress=gr.Progre
 
     progress(0.15, desc="Старт тренировки...")
 
-    train_script = repo / "scripts" / "train_voxcpm_finetune.py"
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     proc = subprocess.Popen(
         [sys.executable, str(train_script), "--config_path", str(config_path)],
-        cwd=str(repo),
+        cwd=str(TRAINING_DIR),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         env=env, text=True, encoding="utf-8", errors="replace", bufsize=1,
     )
@@ -860,6 +847,25 @@ def _advanced_block(prefix: str, show_denoise: bool = False):
     """Accordion с расширенными параметрами."""
     with gr.Accordion(label=I18N("label_advanced"), open=False, elem_id=f"{prefix}_advanced"):
         with gr.Row():
+            lora_sel = gr.Dropdown(
+                label="LoRA (из папки lora/)",
+                choices=["-- Без LoRA --"] + scan_local_loras(),
+                value="-- Без LoRA --" if not _ACTIVE_LORA else _ACTIVE_LORA,
+                interactive=True, scale=3, elem_id=f"{prefix}_lora",
+            )
+            lora_refresh = gr.Button("🔄", size="sm", scale=0, elem_id=f"{prefix}_lora_refresh")
+        lora_status_box = gr.Textbox(label="LoRA статус", interactive=False, value=lora_active_status(), elem_id=f"{prefix}_lora_status")
+        # Handlers — dropdown change = attach/detach
+        def _on_lora_change(name):
+            if name == "-- Без LoRA --":
+                return lora_detach()
+            return lora_attach(name)
+        lora_sel.change(_on_lora_change, inputs=[lora_sel], outputs=[lora_status_box])
+        lora_refresh.click(
+            fn=lambda: gr.update(choices=["-- Без LoRA --"] + scan_local_loras()),
+            outputs=[lora_sel],
+        )
+        with gr.Row():
             cfg = gr.Slider(0.5, 5.0, value=2.0, step=0.1, label=I18N("label_cfg"), info="Выше = ближе к промпту, ниже = больше креатива", elem_id=f"{prefix}_cfg")
             steps = gr.Slider(5, 30, value=10, step=1, label=I18N("label_steps"), info="Больше = качественнее, но медленнее (5-10 для скорости)", elem_id=f"{prefix}_steps")
         with gr.Row():
@@ -1135,26 +1141,8 @@ def build_ui():
             vc_load_cloud_btn.click(load_cloud_list, outputs=[vc_cloud_status, vc_cloud_voices])
             vc_download_btn.click(download_selected_voices, inputs=[vc_cloud_voices], outputs=[vc_download_status, vc_voice_pick])
 
-        # === Таб 4: LoRA ===
+        # === Таб 4: Обучение LoRA ===
         with gr.Tab(label=I18N("tab_lora")):
-            # --- Attach ---
-            gr.Markdown(f"### {I18N('lora_attach_title')}")
-            with gr.Row():
-                with gr.Column(scale=2):
-                    lora_pick = gr.Dropdown(
-                        label="LoRA из папки lora/",
-                        choices=["-- Без LoRA --"] + scan_local_loras(),
-                        value="-- Без LoRA --",
-                        interactive=True,
-                    )
-                    with gr.Row():
-                        lora_attach_btn = gr.Button("Подключить", variant="primary")
-                        lora_detach_btn = gr.Button("Отключить", variant="secondary")
-                        lora_refresh_btn = gr.Button("🔄", size="sm", scale=0)
-                    lora_status = gr.Textbox(label="Статус", interactive=False, value=lora_active_status())
-            gr.Markdown("---")
-
-            # --- Train ---
             gr.Markdown(f"### {I18N('lora_train_title')}")
             gr.Markdown(
                 "**Как подготовить датасет:** загрузите 5-50 аудио (wav/mp3/flac, 3-15 сек каждое), "
@@ -1181,20 +1169,10 @@ def build_ui():
             lora_train_btn = gr.Button("🎓 Начать обучение", variant="primary", size="lg")
             lora_train_log = gr.Textbox(label="Лог тренировки", interactive=False, lines=15)
 
-            # Handlers
-            lora_attach_btn.click(lora_attach, inputs=[lora_pick], outputs=[lora_status])
-            lora_detach_btn.click(lora_detach, outputs=[lora_status])
-            lora_refresh_btn.click(
-                fn=lambda: gr.update(choices=["-- Без LoRA --"] + scan_local_loras()),
-                outputs=[lora_pick],
-            )
             lora_train_btn.click(
                 train_lora,
                 inputs=[lora_name, lora_files, lora_transcripts, lora_r, lora_alpha, lora_steps, lora_lr],
                 outputs=[lora_train_log],
-            ).then(
-                fn=lambda: gr.update(choices=["-- Без LoRA --"] + scan_local_loras()),
-                outputs=[lora_pick],
             )
 
     return demo
