@@ -20,8 +20,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=50, help="Сколько семплов скачать")
     ap.add_argument("--name", default="test_ru", help="Имя папки внутри train_data/")
-    ap.add_argument("--repo", default="niobures/russian-single-speaker-speech-dataset",
-                    help="HF dataset id")
+    ap.add_argument("--repo", default="akuzdeuov/ruslan-tts",
+                    help="HF dataset id (default: RUSLAN — single male Russian voice)")
     ap.add_argument("--min-sec", type=float, default=3.0, help="Мин. длина клипа в сек")
     ap.add_argument("--max-sec", type=float, default=15.0, help="Макс. длина клипа в сек")
     args = ap.parse_args()
