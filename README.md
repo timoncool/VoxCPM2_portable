@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/hero.png" alt="VoxCPM2 Portable" width="100%"/>
+
 # VoxCPM2 Portable
 
 **Portable Windows build of VoxCPM2 — multilingual TTS with Voice Design, Cloning & end-to-end LoRA fine-tuning (video/audio → dataset → training).**
