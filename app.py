@@ -2140,7 +2140,14 @@ def build_ui():
                 with gr.Column(scale=1):
                     tts_out = gr.Audio(label=I18N("label_output"), type="numpy", streaming=True, autoplay=True)
             gr.Examples(examples=TTS_EXAMPLES, inputs=[tts_text], label=I18N("label_examples"), examples_per_page=10)
+            # Pre-click сброс audio-компонента → .then() генератор.
+            # Без этого Gradio 6.10 держит старое streaming-состояние (autoplay не срабатывает,
+            # новые чанки «накладываются» на старые).
             tts_btn.click(
+                lambda: gr.update(value=None),
+                outputs=[tts_out],
+                show_progress="hidden",
+            ).then(
                 tts_generate,
                 inputs=[tts_text, tts_cfg, tts_steps, tts_fmt, tts_retry_max, tts_retry_ratio, tts_min_len, tts_max_len, tts_stream, tts_seed, tts_locked, tts_norm, tts_retry],
                 outputs=[tts_out, tts_seed],
@@ -2169,6 +2176,10 @@ def build_ui():
                         outputs=[vd_desc, vd_text],
                     )
             vd_btn.click(
+                lambda: gr.update(value=None),
+                outputs=[vd_out],
+                show_progress="hidden",
+            ).then(
                 voice_design,
                 inputs=[vd_desc, vd_text, vd_cfg, vd_steps, vd_fmt, vd_retry_max, vd_retry_ratio, vd_min_len, vd_max_len, vd_stream, vd_seed, vd_locked, vd_norm, vd_retry],
                 outputs=[vd_out, vd_seed],
@@ -2235,6 +2246,10 @@ def build_ui():
                         vc_download_status = gr.Textbox(label=I18N("download_status_label"), interactive=False, elem_id="vc_download_status")
 
             vc_btn.click(
+                lambda: gr.update(value=None),
+                outputs=[vc_out],
+                show_progress="hidden",
+            ).then(
                 voice_clone,
                 inputs=[vc_text, vc_ref, vc_style, vc_transcript, vc_cfg, vc_steps, vc_fmt, vc_retry_max, vc_retry_ratio, vc_min_len, vc_max_len, vc_stream, vc_seed, vc_locked, vc_norm, vc_denoise, vc_retry],
                 outputs=[vc_out, vc_seed],
