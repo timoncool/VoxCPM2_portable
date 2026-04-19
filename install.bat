@@ -164,8 +164,13 @@ if not "%CUDA_VERSION%"=="cpu" (
 REM === xformers (memory_efficient_attention) ===
 REM Пинимся на 0.0.31.post1 — единственная версия совместимая с torch 2.7.1.
 REM Без пина pip ставит latest (0.0.35), которая тянет torch 2.11 и сносит весь стек.
+REM Сначала сносим возможный мусор от предыдущих запусков, потом ставим нужную.
 REM Поддержка: все NVIDIA GPU, пропускаем на CPU
 if not "%CUDA_VERSION%"=="cpu" (
+    echo Чистка возможной старой xformers / torch из прошлых запусков...
+    python\python.exe -m pip uninstall xformers -y 2>nul
+    REM Если прошлый запуск зацепил torch 2.11 — откатим его на нужную версию
+    python\python.exe -m pip install torch==%TORCH_VERSION% torchaudio==%TORCHAUDIO_VERSION% --index-url https://download.pytorch.org/whl/%CUDA_VERSION% --no-warn-script-location --force-reinstall --no-deps
     echo Установка xformers 0.0.31.post1 ^(под torch 2.7.1^)...
     python\python.exe -m pip install "xformers==0.0.31.post1" --no-warn-script-location
     if errorlevel 1 (
