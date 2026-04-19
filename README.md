@@ -35,7 +35,7 @@ Built on [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) by OpenBMB — a toke
 - **48 kHz studio output** via AudioVAE V2 super-resolution (16→48 kHz)
 - **Natural prosody** — tokenizer-free diffusion autoregressive architecture
 - Output formats: **MP3** (default), WAV, FLAC, OGG
-- **Autoplay** — generated clip starts playing immediately
+- **Live-streaming playback** — audio starts playing during generation (8 sec prebuffer + 2 sec progressive chunks), no need to wait for full synthesis
 
 ### Voice Design
 - Create voices from **text description** — gender, age, tone, emotion, pace, accent
