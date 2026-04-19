@@ -1354,6 +1354,9 @@ def tts_generate(text, cfg, steps, fmt, retry_max, retry_ratio, min_len, max_len
             retry_max=retry_max, retry_ratio=retry_ratio,
             min_len=min_len, max_len=max_len,
         )
+        # Сброс audio-компонента перед новым стримом — иначе autoplay
+        # не триггерится при повторной генерации
+        yield None, used_seed
         chunks_accum = []
         sr = model.tts_model.sample_rate
         for sr_i, chunk in _generate_audio_stream(model, kwargs, bool(streaming), progress):
@@ -1385,6 +1388,7 @@ def voice_design(description, text, cfg, steps, fmt, retry_max, retry_ratio, min
             retry_max=retry_max, retry_ratio=retry_ratio,
             min_len=min_len, max_len=max_len,
         )
+        yield None, used_seed  # сброс audio-компонента для повторного autoplay
         chunks_accum = []
         sr = model.tts_model.sample_rate
         for sr_i, chunk in _generate_audio_stream(model, kwargs, bool(streaming), progress):
@@ -1447,6 +1451,7 @@ def voice_clone(text, ref_audio, style, transcript, cfg, steps, fmt, retry_max, 
                 **common_kwargs,
                 reference_wav_path=ref_audio,
             )
+        yield None, used_seed  # сброс audio-компонента для повторного autoplay
         chunks_accum = []
         sr = model.tts_model.sample_rate
         for sr_i, chunk in _generate_audio_stream(model, kwargs, bool(streaming), progress):
