@@ -15,6 +15,14 @@
 
 </div>
 
+> 🚀 **One-click cross-platform install via Pinokio:**
+> [![Install on Pinokio](https://img.shields.io/badge/Install_on-Pinokio-7c3aed?style=flat-square)](https://pinokio.co/item?uri=https://github.com/timoncool/VoxCPM2_portable-pinokio)
+> [![Open in Pinokio](https://img.shields.io/badge/Open_in-Pinokio-6d28d9?style=flat-square)](https://beta.pinokio.co/apps/github-com-timoncool-voxcpm2-portable-pinokio)
+>
+> Works on **Windows / Linux (x64 & aarch64) / macOS**. No `install.bat` required — Pinokio manages CUDA, Python 3.12, PyTorch, Flash-Attn wheels, and FFmpeg for you.
+>
+> Launcher repo: **[timoncool/VoxCPM2_portable-pinokio](https://github.com/timoncool/VoxCPM2_portable-pinokio)**
+
 Generate natural multilingual speech, design brand-new voices from text descriptions, clone any voice from a reference clip, and **train your own LoRA straight from a video or audio file** — upload 8 minutes of a podcast and the app slices it into clips, auto-transcribes, picks the optimal training parameters and starts the run. **100% local**, no cloud, no API keys. One-click install on Windows, runs on any NVIDIA GPU with 8+ GB VRAM.
 
 Built on [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) by OpenBMB — a tokenizer-free 2B-parameter diffusion autoregressive TTS model trained on 2M+ hours of speech.
