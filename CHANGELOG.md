@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-04-25
+
+### Fixed
+- **Tab hangs in Gradio UI** — outer tabs (TTS / Design / Clone / LoRA) now use `render_children=False`, so Gradio 6.10 only mounts the active tab's components instead of rendering all of them eagerly. Eliminates stutters and freezes when switching tabs. Inside LoRA, the nested `gr.Tabs()` (Auto / Manual modes) was replaced with two `gr.Accordion` blocks (Auto open by default, Manual collapsed) — nested Tabs is a known source of UI freezes in Gradio 6. Credit: fix proposed by Aaron Lee.
+
 ## 2026-04-23
 
 ### Added
