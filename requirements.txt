@@ -2,7 +2,7 @@
 voxcpm>=2.0
 
 # UI (Gradio 6.11+ имеет баг tabs freeze #13198 — пин на 6.10.0 — последняя стабильная)
-gradio==6.10.0
+gradio==6.11.0
 
 # Аудио/IO
 soundfile>=0.13.1
