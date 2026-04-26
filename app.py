@@ -1481,24 +1481,21 @@ TTS_EXAMPLES = [
 ]
 
 DESIGN_EXAMPLES = [
-    # Все описания голоса строго на английском — VoxCPM2 парсит стиль-промпт
-    # только по английским фразам, русский просто читается вслух.
+    ["Молодая женщина, нежный и мягкий голос", "Привет, добро пожаловать в VoxCPM2!"],
+    ["Пожилой мужчина с глубоким баритоном, говорит медленно и внушительно", "Давным-давно, в далёкой галактике..."],
+    ["Весёлый ребёнок, энергично и быстро", "Ура! Сегодня выходной!"],
     ["A young woman with a soft gentle voice", "Hello, welcome to VoxCPM2!"],
     ["An elderly British man, deep and authoritative", "Once upon a time, in a galaxy far far away..."],
     ["A cheerful child, energetic and playful", "Yay! It's weekend today!"],
-    ["A confident radio host, clear and engaging", "Good morning everyone, and welcome back to the show!"],
-    ["A mysterious narrator, slow and atmospheric", "In the depths of the ancient forest, secrets lay buried for centuries."],
-    ["A young man, calm and thoughtful", "Let me tell you something I've been thinking about lately."],
 ]
 
 CLONE_STYLE_EXAMPLES = [
-    # Стиль должен быть на английском (см. комментарий выше у DESIGN_EXAMPLES)
+    "чуть быстрее, бодрым тоном",
+    "медленно и драматично",
+    "шёпотом, интимно",
     "slightly faster, cheerful tone",
     "slow and dramatic",
     "whispering, intimate",
-    "sad and melancholic",
-    "angry and intense",
-    "calm and reassuring",
 ]
 
 
@@ -2049,10 +2046,10 @@ I18N = gr.I18n(
         "lora_name_info": "Используется и для папки датасета (train_data/<имя>/), и для папки LoRA (lora/<имя>/)",
         # --- Placeholders ---
         "ph_tts_text": "Введите текст на любом из 30 поддерживаемых языков...",
-        "ph_design_desc": "A young woman with a soft gentle voice",
+        "ph_design_desc": "например: Молодая женщина, нежный и мягкий голос",
         "ph_design_text": "Привет, добро пожаловать в VoxCPM2!",
         "ph_clone_transcript": "Точный текст того что говорится в референс-аудио",
-        "ph_clone_style": "slightly faster, cheerful tone",
+        "ph_clone_style": "например: чуть быстрее, бодрым тоном",
         "ph_transcripts": "clip_001.wav|Здравствуйте, меня зовут Иван.\nclip_002.wav|Сегодня отличная погода.",
         # --- Info hints ---
         "info_auto_min_sec": "Клипы короче отбрасываются",
@@ -2123,10 +2120,8 @@ _HEAD_SCRIPT = """
 
 
 def build_ui():
-    # Gradio 6.10: theme/css/head passed to launch(), not Blocks()
     with gr.Blocks(
         title="VoxCPM2 — Multilingual TTS",
-        head=_HEAD_SCRIPT,
         delete_cache=(300, 3600),
     ) as demo:
         gr.HTML(I18N("brand_header_html"))
@@ -2286,8 +2281,7 @@ def build_ui():
 
             gr.Markdown(I18N("md_step1_title"))
 
-            # Два режима — без вложенных Tabs (зависают), а через Accordion
-            # === АВТО из видео/аудио ===
+            # Два режима — взаимоисключающие суб-табы
             with gr.Accordion(I18N("lora_auto_title"), open=True):
                 gr.Markdown(I18N("lora_auto_desc"))
                 with gr.Accordion(I18N("lora_auto_how_title"), open=False):
@@ -2319,7 +2313,7 @@ def build_ui():
                 auto_btn = gr.Button(I18N("lora_auto_btn"), variant="primary", size="lg")
                 auto_log = gr.Textbox(label=I18N("lora_auto_log"), interactive=False, lines=18)
 
-            # === РУЧНОЙ режим ===
+                # === РУЧНОЙ режим ===
             with gr.Accordion(I18N("lora_train_title"), open=False):
                 gr.Markdown(I18N("lora_manual_desc"))
                 lora_files = gr.Files(
@@ -2376,11 +2370,10 @@ if __name__ == "__main__":
     demo = build_ui()
     demo.queue(default_concurrency_limit=1).launch(
         server_port=None,
-        # NO_AUTO_BROWSER=true → skip opening system browser (Pinokio & other launchers open their own tab)
-        inbrowser=(os.environ.get("NO_AUTO_BROWSER", "").lower() not in ("1", "true", "yes")),
+        inbrowser=True,
         i18n=I18N,
         theme=gr.themes.Soft(primary_hue="purple"),
         css=_CSS,
-        head=_HEAD_SCRIPT,
+        head=_HEAD_JS,
         show_error=True,
     )
