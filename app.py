@@ -98,12 +98,159 @@ VOICES_DIR = SCRIPT_DIR / "voices"
 LORA_DIR = SCRIPT_DIR / "lora"
 TRAIN_DATA_DIR = SCRIPT_DIR / "train_data"
 TRAINING_DIR = SCRIPT_DIR / "training"  # bundled train scripts (in repo)
+
+# === Local model cache setup (always next to app.py) ===
+VOXCPM2_CACHE_DIR = Path(__file__).parent.absolute() / "models" / "voxcpm2"
+ZIPENHANCER_REPO = "iic/speech_zipenhancer_ans_multiloss_16k_base"
+ZIPENHANCER_CACHE_DIR = Path(__file__).parent.absolute() / "models" / "zipenhancer"
+
+
+def _ensure_voxcpm2_local() -> str:
+    """
+    Ensure VoxCPM2 model is available locally (offline mode).
+    Checks local cache folder first; if missing, downloads via ModelScope/HF.
+    Returns the absolute local path to the model directory.
+    """
+    local_path = VOXCPM2_CACHE_DIR / "openbmb_VoxCPM2"
+
+    # Check if already cached locally (look for config.json or model.safetensors)
+    if local_path.exists() and (
+        (local_path / "config.json").exists() or 
+        (local_path / "model.safetensors").exists() or
+        (local_path / "pytorch_model.bin").exists()
+    ):
+        print(f"[voxcpm2] Using local cache: {local_path}")
+        return str(local_path)
+
+    # Need to download
+    print(f"[voxcpm2] Model not found locally. Downloading to {VOXCPM2_CACHE_DIR}...")
+    VOXCPM2_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Try ModelScope first (better for China/Russia, often faster)
+    try:
+        from modelscope import snapshot_download
+        downloaded_path = snapshot_download(
+            "openbmb/VoxCPM2",
+            local_dir=str(local_path),
+        )
+        print(f"[voxcpm2] Downloaded via ModelScope: {downloaded_path}")
+        return downloaded_path
+    except ImportError:
+        print("[voxcpm2] modelscope not installed. Run: pip install modelscope")
+    except Exception as e:
+        print(f"[voxcpm2] ModelScope download failed: {e}")
+
+    # Fallback: HuggingFace
+    try:
+        from huggingface_hub import snapshot_download
+        downloaded_path = snapshot_download(
+            "openbmb/VoxCPM2",
+            local_dir=str(local_path),
+            local_files_only=False,
+        )
+        print(f"[voxcpm2] Downloaded via HuggingFace: {downloaded_path}")
+        return downloaded_path
+    except ImportError:
+        print("[voxcpm2] huggingface_hub not installed.")
+    except Exception as e:
+        print(f"[voxcpm2] HuggingFace download failed: {e}")
+
+    # Final fallback: check if modelscope already downloaded it to its default cache
+    try:
+        from modelscope.hub.utils.utils import get_cache_dir
+        ms_cache = Path(get_cache_dir()) / "hub" / "openbmb_VoxCPM2"
+        if ms_cache.exists() and (ms_cache / "config.json").exists():
+            print(f"[voxcpm2] Found in ModelScope default cache, copying to {local_path}...")
+            import shutil
+            shutil.copytree(ms_cache, local_path, dirs_exist_ok=True)
+            return str(local_path)
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        f"Could not download VoxCPM2 model. Please manually download it:\n"
+        f"  1) Install modelscope: pip install modelscope\n"
+        f"  2) Download: modelscope download --model openbmb/VoxCPM2 --local_dir \"{local_path}\"\n"
+        f"Or place the model files directly in: {local_path}\n"
+        f"Model files should include: config.json, model.safetensors, audiovae.pth, etc."
+    )
+
+
+
+
+def _ensure_zipenhancer_local() -> str:
+    """
+    Ensure ZipEnhancer model is available locally (offline mode).
+    Checks local cache folder first; if missing, downloads via ModelScope/HF.
+    Returns the absolute local path to the model directory.
+    """
+    local_path = ZIPENHANCER_CACHE_DIR / "speech_zipenhancer_ans_multiloss_16k_base"
+
+    # Check if already cached locally
+    if local_path.exists() and (local_path / "configuration.json").exists():
+        print(f"[zipenhancer] Using local cache: {local_path}")
+        return str(local_path)
+
+    # Need to download
+    print(f"[zipenhancer] Model not found locally. Downloading to {ZIPENHANCER_CACHE_DIR}...")
+    ZIPENHANCER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Try ModelScope first (original source for this model)
+    try:
+        from modelscope import snapshot_download
+        downloaded_path = snapshot_download(
+            ZIPENHANCER_REPO,
+            local_dir=str(local_path),
+        )
+        print(f"[zipenhancer] Downloaded via ModelScope: {downloaded_path}")
+        return downloaded_path
+    except ImportError:
+        print("[zipenhancer] modelscope not installed. Run: pip install modelscope")
+    except Exception as e:
+        print(f"[zipenhancer] ModelScope download failed: {e}")
+
+    # Fallback: try HuggingFace (some mirrors host it)
+    try:
+        from huggingface_hub import snapshot_download
+        downloaded_path = snapshot_download(
+            ZIPENHANCER_REPO,
+            local_dir=str(local_path),
+            local_files_only=False,
+        )
+        print(f"[zipenhancer] Downloaded via HuggingFace: {downloaded_path}")
+        return downloaded_path
+    except ImportError:
+        print("[zipenhancer] huggingface_hub not installed.")
+    except Exception as e:
+        print(f"[zipenhancer] HuggingFace download failed: {e}")
+
+    # Final fallback: check if modelscope already downloaded it to its default cache
+    try:
+        from modelscope.hub.utils.utils import get_cache_dir
+        ms_cache = Path(get_cache_dir()) / "hub" / ZIPENHANCER_REPO.replace("/", "_")
+        if ms_cache.exists() and (ms_cache / "configuration.json").exists():
+            print(f"[zipenhancer] Found in ModelScope default cache, copying to {local_path}...")
+            import shutil
+            shutil.copytree(ms_cache, local_path, dirs_exist_ok=True)
+            return str(local_path)
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        f"Could not download ZipEnhancer model. Please manually download it:\n"
+        f"  1) Install modelscope: pip install modelscope\n"
+        f"  2) Download: modelscope download --model {ZIPENHANCER_REPO} --local_dir \"{local_path}\"\n"
+        f"Or place the model files directly in: {local_path}\n"
+        f"Model files should include: configuration.json, model.pt, etc."
+    )
+
+
 OUTPUT_DIR.mkdir(exist_ok=True)
 VOICES_DIR.mkdir(exist_ok=True)
 LORA_DIR.mkdir(exist_ok=True)
 TRAIN_DATA_DIR.mkdir(exist_ok=True)
 
-MODEL_REF = "openbmb/VoxCPM2"
+MODEL_REF = "openbmb/VoxCPM2"  # HF repo ID; actual path resolved via _ensure_voxcpm2_local()
 
 # === Voice pack (русские голоса с HuggingFace) ===
 CLOUD_VOICES_REPO = "Slait/russia_voices"
@@ -1179,7 +1326,26 @@ def get_model(lora_weights_path: Optional[str] = None, force_reload: bool = Fals
             torch.cuda.empty_cache()
         _model = None
     print(f"[VoxCPM2] Loading {MODEL_REF}" + (f" + LoRA {lora_weights_path}" if lora_weights_path else ""))
+
+    # Resolve local VoxCPM2 path
+    try:
+        voxcpm2_local = _ensure_voxcpm2_local()
+        model_path = voxcpm2_local
+        print(f"[voxcpm2] Using local path: {voxcpm2_local}")
+    except Exception as e:
+        print(f"[voxcpm2] WARNING: Could not setup local VoxCPM2: {e}")
+        print("[voxcpm2] Falling back to online HuggingFace ID (requires internet)...")
+        model_path = MODEL_REF
+
     kwargs = dict(load_denoiser=True, optimize=False)
+    # Use local/offline ZipEnhancer model
+    try:
+        zipenhancer_local = _ensure_zipenhancer_local()
+        kwargs["zipenhancer_model_id"] = zipenhancer_local
+        print(f"[zipenhancer] Using local path: {zipenhancer_local}")
+    except Exception as e:
+        print(f"[zipenhancer] WARNING: Could not setup local ZipEnhancer: {e}")
+        print("[zipenhancer] Falling back to online mode (may require internet)...")
     if lora_weights_path:
         kwargs["lora_weights_path"] = lora_weights_path
         # Явно читаем lora_config.json и конструируем LoRAConfig — иначе voxcpm использует default (r=8)
@@ -1194,7 +1360,7 @@ def get_model(lora_weights_path: Optional[str] = None, force_reload: bool = Fals
                 print(f"[lora] loaded lora_config.json: r={cfg_data.get('r')}, alpha={cfg_data.get('alpha')}")
             except Exception as exc:
                 print(f"[lora] WARNING: failed to read lora_config.json: {exc}")
-    _model = VoxCPM.from_pretrained(MODEL_REF, **kwargs)
+    _model = VoxCPM.from_pretrained(model_path, **kwargs)
     print(f"[VoxCPM2] Model loaded. Sample rate: {_model.tts_model.sample_rate} Hz")
     return _model
 
