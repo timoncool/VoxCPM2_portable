@@ -105,11 +105,12 @@ def resolve_audio_files(
     *,
     base_dir: str | os.PathLike[str] | None = None,
 ) -> list[Path]:
-    """Resolve one audio file or all supported audio files in one folder.
+    """Resolve one audio file or all supported audio files in a dataset folder.
 
-    Folder contents are not searched recursively.  The returned order is
-    deterministic and case-insensitive, which also makes transcript previews
-    stable across platforms.
+    Files directly inside the selected folder are preferred. If none exist,
+    the conventional ``folder/audio`` layout produced by Auto-prepare is used.
+    No other recursive search is performed. The returned order is deterministic
+    and case-insensitive, which keeps transcript previews stable across systems.
     """
 
     path = resolve_pasted_path(raw_path, base_dir=base_dir)
@@ -133,8 +134,22 @@ def resolve_audio_files(
         ),
         key=lambda child: (child.name.casefold(), child.name),
     )
+    if not audio_files and (path / "audio").is_dir():
+        audio_folder = path / "audio"
+        audio_files = sorted(
+            (
+                child.resolve(strict=False)
+                for child in audio_folder.iterdir()
+                if child.is_file()
+                and child.suffix.casefold() in SUPPORTED_AUDIO_SUFFIXES
+            ),
+            key=lambda child: (child.name.casefold(), child.name),
+        )
     if not audio_files:
-        raise LocalMediaError(f"No supported audio files found in folder: {path}")
+        raise LocalMediaError(
+            "No supported audio files found directly in the folder or its "
+            f"audio subfolder: {path}"
+        )
     return audio_files
 
 
@@ -185,8 +200,13 @@ def find_transcripts_file(
 
     path = resolve_pasted_path(raw_path, base_dir=base_dir)
     folder = path.parent if path.is_file() else path
-    candidate = folder / "transcripts.txt"
-    return candidate.resolve(strict=False) if candidate.is_file() else None
+    candidates = [folder / "transcripts.txt"]
+    if folder.name.casefold() == "audio":
+        candidates.append(folder.parent / "transcripts.txt")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve(strict=False)
+    return None
 
 
 def read_transcripts(

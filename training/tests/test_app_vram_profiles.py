@@ -71,7 +71,9 @@ class AppVramProfileTests(unittest.TestCase):
     def test_local_folder_fallback_enters_the_normal_training_pipeline(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             folder = Path(temp_dir)
-            (folder / "voice.wav").touch()
+            audio_folder = folder / "audio"
+            audio_folder.mkdir()
+            (audio_folder / "voice.wav").touch()
             (folder / "transcripts.txt").write_text(
                 "voice.wav|Local path transcript\n",
                 encoding="utf-8",

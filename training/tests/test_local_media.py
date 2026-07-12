@@ -84,6 +84,25 @@ class AudioPathTests(unittest.TestCase):
 
             self.assertEqual([path.name for path in resolved], expected_names)
 
+    def test_auto_prepare_dataset_root_uses_audio_subfolder(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset = Path(temp_dir)
+            audio_folder = dataset / "audio"
+            audio_folder.mkdir()
+            first = audio_folder / "clip_0001.wav"
+            second = audio_folder / "clip_0002.flac"
+            first.touch()
+            second.touch()
+            (dataset / "transcripts.txt").write_text(
+                "clip_0001.wav|First\nclip_0002.flac|Second\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                resolve_audio_files(dataset),
+                [first.resolve(), second.resolve()],
+            )
+
     def test_unsupported_file_and_empty_folder_are_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             folder = Path(temp_dir)
@@ -163,6 +182,17 @@ class TranscriptTests(unittest.TestCase):
             transcript.write_text("one.wav|First\ntwo.wav|Second", encoding="utf-8")
 
             self.assertEqual(read_transcripts(folder), "one.wav|First\ntwo.wav|Second")
+
+    def test_audio_subfolder_finds_dataset_root_transcripts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dataset = Path(temp_dir)
+            audio_folder = dataset / "audio"
+            audio_folder.mkdir()
+            transcript = dataset / "transcripts.txt"
+            transcript.write_text("clip.wav|Dataset root\n", encoding="utf-8")
+
+            self.assertEqual(find_transcripts_file(audio_folder), transcript.resolve())
+            self.assertEqual(read_transcripts(audio_folder), "clip.wav|Dataset root\n")
 
     def test_missing_transcripts_returns_none(self):
         with tempfile.TemporaryDirectory() as temp_dir:
