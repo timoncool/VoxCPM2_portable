@@ -93,11 +93,41 @@ from voxcpm import VoxCPM
 
 # === Конфигурация ===
 SCRIPT_DIR = Path(__file__).parent.absolute()
+# Embedded/portable Python can omit the application directory from sys.path.
+# Keep bundled helper modules importable when app.py is launched through an
+# alternate entry point (for example the Gradio API smoke-test launcher).
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 OUTPUT_DIR = SCRIPT_DIR / "output"
 VOICES_DIR = SCRIPT_DIR / "voices"
 LORA_DIR = SCRIPT_DIR / "lora"
 TRAIN_DATA_DIR = SCRIPT_DIR / "train_data"
 TRAINING_DIR = SCRIPT_DIR / "training"  # bundled train scripts (in repo)
+
+from training.audio_splitting import (
+    extract_absolute_words_from_timestamped_segment,
+    partition_transcript,
+    plan_no_drop_splits,
+    slice_audio_file,
+    validate_split_plan,
+)
+from training.local_media import (
+    LocalMediaError,
+    read_transcripts,
+    resolve_audio_files,
+    resolve_single_media_file,
+)
+from training.vram_profiles import (
+    VRAM_PROFILES,
+    build_training_command,
+    load_vram_preference,
+    profile_for_vram_gib,
+    resolve_vram_profile,
+    save_vram_preference,
+    validate_lora_hyperparameters,
+)
+
+VRAM_PREFERENCE_PATH = SCRIPT_DIR / "cache" / "vram_profile.json"
 
 # === Local model cache setup (always next to app.py) ===
 VOXCPM2_CACHE_DIR = Path(__file__).parent.absolute() / "models" / "voxcpm2"
@@ -360,6 +390,133 @@ def load_cloud_list():
 _ACTIVE_LORA: Optional[str] = None  # имя загруженной LoRA или None
 
 
+def detected_vram_gib() -> Optional[float]:
+    """Return physical VRAM without letting CUDA probing break WebUI startup."""
+    try:
+        if not torch.cuda.is_available():
+            return None
+        return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    except Exception as exc:
+        print(f"[VRAM] CUDA memory detection failed: {exc}")
+        return None
+
+
+def recommend_vram_profile(total_vram_gib: Optional[float] = None) -> str:
+    """Recommend a preset from physical VRAM without locking the UI choice."""
+    total = detected_vram_gib() if total_vram_gib is None else total_vram_gib
+    if total is None:
+        return "8gb"
+    try:
+        return profile_for_vram_gib(total)
+    except ValueError as exc:
+        # There is no sub-8 GB training profile.  Keep the UI renderable, while
+        # explicit manual values are rejected by _resolve_vram_profile().
+        print(f"[VRAM] {exc}; showing the minimum 8 GB profile")
+        return "8gb"
+
+
+def _resolve_vram_profile(profile) -> tuple[str, dict]:
+    """Resolve aliases/manual GiB amounts using the shared trainer contract."""
+    if profile is None or (isinstance(profile, str) and not profile.strip()):
+        profile = recommend_vram_profile()
+    return resolve_vram_profile(profile)
+
+
+def load_selected_vram_profile() -> str:
+    """Use the last explicit selection, falling back to hardware detection."""
+    return load_vram_preference(VRAM_PREFERENCE_PATH, recommend_vram_profile())
+
+
+def persist_vram_profile(profile) -> str:
+    """Persist a dropdown profile or a manually entered VRAM amount."""
+    return save_vram_preference(VRAM_PREFERENCE_PATH, profile)
+
+
+# Gradio 6.11 does not resolve I18nData nested inside ``(label, value)``
+# dropdown choices. It renders the serialized ``__i18n__{...}`` payload
+# literally. Keep the labels human-readable while preserving stable profile
+# codes for the backend and public API.
+VRAM_PROFILE_DROPDOWN_CHOICES = [
+    ("8 GB — safe", "8gb"),
+    ("12 GB — balanced", "12gb"),
+    ("16 GB — balanced", "16gb"),
+    (">16 GB — max speed (unrestricted)", "over_16gb"),
+]
+
+
+def _persist_vram_profile_from_ui(profile) -> None:
+    """Best-effort persistence for the dropdown change event."""
+    try:
+        persist_vram_profile(profile)
+    except (OSError, ValueError) as exc:
+        # Selection should still work when the portable directory is read-only.
+        print(f"[VRAM] Could not persist profile selection: {exc}")
+
+
+def _normalize_lora_run_name(value) -> str:
+    """Validate a result-folder name before any directory can be removed."""
+    name = str(value or "").strip().replace(" ", "_")
+    if not name:
+        raise ValueError("Specify a LoRA name")
+    if len(name) > 100:
+        raise ValueError("LoRA name is too long (maximum 100 characters)")
+    invalid = '<>:"/\\|?*'
+    if name in {".", ".."} or name.endswith((".", " ")) or any(
+        character in invalid or ord(character) < 32 for character in name
+    ):
+        raise ValueError("LoRA name must be a single safe folder name")
+    if name.upper().split(".", 1)[0] in {
+        "CON", "PRN", "AUX", "NUL",
+        *(f"COM{index}" for index in range(1, 10)),
+        *(f"LPT{index}" for index in range(1, 10)),
+    }:
+        raise ValueError("LoRA name is reserved by Windows")
+    return name
+
+
+def release_training_gpu_memory() -> str:
+    """Unload WebUI inference/ASR state before the trainer claims the GPU.
+
+    ONNX Runtime owns its CUDA allocations outside PyTorch, so dropping the
+    final ASR adapter reference and running GC is as important as empty_cache().
+    The inference model is lazy and will be loaded again on the next TTS call.
+    """
+    global _model, _asr_model, _ACTIVE_LORA
+    import gc
+
+    released = []
+    if _model is not None:
+        _model = None
+        _ACTIVE_LORA = None
+        released.append("TTS")
+    if _asr_model is not None:
+        _asr_model = None
+        released.append("ASR")
+
+    gc.collect()
+    if not torch.cuda.is_available():
+        return "Freed " + (" + ".join(released) if released else "no loaded GPU models")
+
+    try:
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+        free_bytes, total_bytes = torch.cuda.mem_get_info(0)
+        free_gib = free_bytes / (1024 ** 3)
+        total_gib = total_bytes / (1024 ** 3)
+        allocated_gib = torch.cuda.memory_allocated(0) / (1024 ** 3)
+        reserved_gib = torch.cuda.memory_reserved(0) / (1024 ** 3)
+        what = " + ".join(released) if released else "no loaded WebUI models"
+        return (
+            f"Freed {what}; GPU free {free_gib:.2f}/{total_gib:.2f} GB "
+            f"(PyTorch allocated {allocated_gib:.2f} GB, reserved {reserved_gib:.2f} GB)"
+        )
+    except Exception as exc:
+        return f"Freed WebUI references; CUDA memory status unavailable: {exc}"
+
+
 def scan_local_loras() -> list[str]:
     """Список локальных LoRA чекпоинтов в lora/ (по наличию lora_config.json)."""
     result = []
@@ -487,10 +644,14 @@ def get_asr_model(language: Optional[str] = None):
 
 
 def _ffmpeg_bin() -> str:
-    """Путь к ffmpeg: сначала портативный ffmpeg/bin/ffmpeg.exe, иначе системный."""
-    portable = SCRIPT_DIR / "ffmpeg" / "bin" / ("ffmpeg.exe" if sys.platform == "win32" else "ffmpeg")
-    if portable.exists():
-        return str(portable)
+    """Return the portable ffmpeg path, supporting both shipped layouts."""
+    executable = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+    for portable in (
+        SCRIPT_DIR / "ffmpeg" / executable,
+        SCRIPT_DIR / "ffmpeg" / "bin" / executable,
+    ):
+        if portable.exists():
+            return str(portable)
     return "ffmpeg"
 
 
@@ -544,23 +705,43 @@ def _extract_words_from_result(result) -> list[dict]:
 
     tokens = getattr(result, "tokens", None)
     timestamps = getattr(result, "timestamps", None)
+    seg_start = float(getattr(result, "start", 0.0) or 0.0)
     seg_end = float(getattr(result, "end", 0.0) or 0.0)
 
     # --- Основной путь: TimestampedSegmentResult с параллельными tokens + timestamps ---
     if tokens is not None and timestamps is not None and len(tokens) == len(timestamps):
+        # onnx-asr's VAD wrapper reports segment bounds in full-file time but
+        # token timestamps in the sliced segment's local time.  Detect that
+        # representation and put every boundary in full-file coordinates.
+        raw_timestamps = [float(ts) for ts in timestamps]
+        seg_duration = max(0.0, seg_end - seg_start)
+        relative_timestamps = bool(raw_timestamps) and (
+            min(raw_timestamps) >= -0.05
+            and max(raw_timestamps) <= seg_duration + 0.25
+            and seg_start > 0.0
+        )
+        timestamp_offset = seg_start if relative_timestamps else 0.0
+        final_token_end = (
+            seg_start + seg_duration if relative_timestamps else seg_end
+        )
         cur = None
-        for i, (tok, ts) in enumerate(zip(tokens, timestamps)):
+        for i, (tok, raw_ts) in enumerate(zip(tokens, raw_timestamps)):
             tok_s = str(tok)
-            next_ts = float(timestamps[i + 1]) if (i + 1) < len(timestamps) else (seg_end or float(ts))
+            ts = raw_ts + timestamp_offset
+            next_ts = (
+                raw_timestamps[i + 1] + timestamp_offset
+                if (i + 1) < len(raw_timestamps)
+                else (final_token_end or ts)
+            )
             is_new_word = tok_s.startswith(" ") or i == 0
             piece = tok_s.lstrip(" ")
             if is_new_word:
                 if cur and cur["text"]:
                     words.append(cur)
-                cur = {"text": piece, "start": float(ts), "end": float(next_ts)}
+                cur = {"text": piece, "start": ts, "end": float(next_ts)}
             else:
                 if cur is None:
-                    cur = {"text": piece, "start": float(ts), "end": float(next_ts)}
+                    cur = {"text": piece, "start": ts, "end": float(next_ts)}
                 else:
                     cur["text"] += piece
                     cur["end"] = float(next_ts)
@@ -591,6 +772,64 @@ def _extract_words_from_result(result) -> list[dict]:
         if text:
             words.append({"text": text, "start": start, "end": end})
     return words
+
+
+def _split_asr_segment_no_drop(
+    *,
+    seg_start: float,
+    seg_end: float,
+    seg_text: str,
+    words: list[dict],
+    max_sec: float,
+    target_max: float,
+) -> tuple[list[dict], dict]:
+    """Split one VAD segment without silently losing speech or transcript.
+
+    Word timestamps are preferred.  Some ASR backends omit them; in that case
+    deterministic synthetic word spans preserve the complete ASR transcript
+    while still producing bounded audio windows.
+    """
+    source_words = list(words or [])
+    if not source_words:
+        tokens = [token for token in (seg_text or "").split() if token]
+        if not tokens:
+            return [], {
+                "source_duration_sec": max(0.0, seg_end - seg_start),
+                "planned_duration_sec": 0.0,
+                "textless_duration_sec": 0.0,
+                "part_count": 0,
+            }
+        span = max(0.0, seg_end - seg_start)
+        source_words = []
+        for index, token in enumerate(tokens):
+            start = seg_start + span * index / len(tokens)
+            end = seg_start + span * (index + 1) / len(tokens)
+            source_words.append({"text": token, "start": start, "end": end})
+
+    plan = plan_no_drop_splits(
+        source_words,
+        source_start=seg_start,
+        source_end=seg_end,
+        max_part_sec=max_sec,
+        target_part_sec=min(target_max, max_sec),
+    )
+    audit = validate_split_plan(plan, allow_textless_parts=True)
+    segments = [
+        {
+            "start": part.start,
+            "end": part.end,
+            "text": part.text,
+            "_exact_bounds": True,
+        }
+        for part in plan.parts
+        if part.has_text
+    ]
+    return segments, {
+        "source_duration_sec": audit.source_duration_sec,
+        "planned_duration_sec": audit.planned_duration_sec,
+        "textless_duration_sec": audit.textless_duration_sec,
+        "part_count": audit.part_count,
+    }
 
 
 # Пунктуация конца предложения (включая русские/англ/CJK)
@@ -845,31 +1084,31 @@ def recommend_lora_settings(n_clips: int, total_speech_sec: float) -> tuple[int,
 
     if minutes < 2:
         target_epochs = 25; r, a, lr = 32, 32, 1e-4
-        note = f"⚠ очень мало речи ({minutes:.1f} мин) — ниже минимума OpenBMB (5 мин). Качество будет слабым"
+        note = f"⚠ very little speech ({minutes:.1f} min), below OpenBMB's 5-minute minimum"
     elif minutes < 5:
         target_epochs = 20; r, a, lr = 32, 32, 1e-4
-        note = f"минимум для LoRA ({minutes:.1f} мин)"
+        note = f"minimum-size LoRA dataset ({minutes:.1f} min)"
     elif minutes < 10:
         target_epochs = 15; r, a, lr = 32, 32, 1e-4
-        note = f"стандарт speaker cloning ({minutes:.1f} мин)"
+        note = f"standard speaker-cloning dataset ({minutes:.1f} min)"
     elif minutes < 20:
         target_epochs = 12; r, a, lr = 32, 32, 1e-4
-        note = f"средний датасет ({minutes:.1f} мин)"
+        note = f"medium dataset ({minutes:.1f} min)"
     elif minutes < 60:
         target_epochs = 8; r, a, lr = 32, 32, 1e-4
-        note = f"большой датасет ({minutes:.1f} мин)"
+        note = f"large dataset ({minutes:.1f} min)"
     elif minutes < 120:
         target_epochs = 5; r, a, lr = 64, 64, 5e-5
-        note = f"очень большой ({minutes:.1f} мин), r=64, lr снижен"
+        note = f"very large dataset ({minutes:.1f} min), using r=64 and a lower learning rate"
     else:
         target_epochs = 3; r, a, lr = 64, 64, 5e-5
-        note = f"style/lang adaptation ({minutes:.1f} мин), r=64"
+        note = f"style/language adaptation dataset ({minutes:.1f} min), using r=64"
 
     # steps = epochs × n_clips / effective_batch, округляем к кратному 50, минимум 100
     steps = max(100, int(round(target_epochs * n_clips / max(eff_batch, 1) / 50.0)) * 50)
     reason = (
-        f"{note} → цель {target_epochs} эпох × {n_clips} клипов / eff_batch={eff_batch} "
-        f"= {steps} шагов"
+        f"{note} → target {target_epochs} epochs × {n_clips} clips / "
+        f"effective batch={eff_batch} = {steps} steps"
     )
     return r, a, steps, lr, reason
 
@@ -884,6 +1123,7 @@ def auto_prepare_dataset(
     start_training: bool,
     auto_tune: bool,
     r: int, alpha: int, steps: int, lr: float,
+    local_media_path: str = "",
     progress=gr.Progress(),
 ):
     """
@@ -897,29 +1137,46 @@ def auto_prepare_dataset(
         log.append(msg)
         print(f"[auto] {msg}")
 
-    # --- валидация ---
-    if not name or not name.strip():
-        emit("❌ Укажи имя датасета / LoRA")
-        yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
-        return
-    name = name.strip().replace(" ", "_")
-
-    if not input_file:
-        emit("❌ Загрузи видео или аудио")
+    # Validate before creating or clearing any dataset directory.
+    try:
+        name = _normalize_lora_run_name(name)
+    except ValueError as exc:
+        emit(f"❌ {exc}")
         yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
         return
 
-    src_path = Path(input_file)
+    if input_file:
+        src_path = Path(input_file)
+        source_kind = "uploaded file"
+    elif local_media_path and str(local_media_path).strip():
+        try:
+            src_path = resolve_single_media_file(
+                local_media_path,
+                base_dir=SCRIPT_DIR,
+            )
+        except LocalMediaError as exc:
+            emit(f"❌ {exc}")
+            yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
+            return
+        source_kind = "local path"
+    else:
+        emit("❌ Upload a video/audio file or paste a local media path")
+        yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
+        return
+
     if not src_path.exists():
-        emit(f"❌ Файл не найден: {input_file}")
+        emit(f"❌ File not found: {src_path}")
         yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
         return
 
-    progress(0.02, desc="Проверка файла...")
+    progress(0.02, desc="Checking input file...")
     duration = _ffprobe_duration(str(src_path))
-    emit(f"▶ Входной файл: {src_path.name} ({duration:.1f} сек)")
+    emit(f"▶ Input ({source_kind}): {src_path.name} ({duration:.1f} sec)")
     if duration > 0 and duration < min_sec * 3:
-        emit(f"⚠ Файл очень короткий ({duration:.1f} сек). Нужно минимум ~1-2 мин для разумного датасета.")
+        emit(
+            f"⚠ The file is very short ({duration:.1f} sec). "
+            "Use at least 1–2 minutes for a useful dataset."
+        )
 
     ds_dir = TRAIN_DATA_DIR / name
     audio_dir = ds_dir / "audio"
@@ -932,34 +1189,34 @@ def auto_prepare_dataset(
     yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
 
     # --- 1. ffmpeg → 16kHz mono ---
-    progress(0.05, desc="Извлечение аудио (ffmpeg)...")
-    emit("▶ Извлекаю аудио в 16kHz mono WAV...")
+    progress(0.05, desc="Extracting audio with ffmpeg...")
+    emit("▶ Converting audio to 16 kHz mono WAV...")
     full_wav = ds_dir / "_full_16k.wav"
     if not extract_audio_16k_mono(str(src_path), full_wav):
-        emit("❌ ffmpeg не смог извлечь аудио. Проверь формат файла.")
+        emit("❌ ffmpeg could not extract the audio. Check the file format.")
         yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
         return
-    emit(f"✓ {full_wav.name} готов")
+    emit(f"✓ Created {full_wav.name}")
     yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
 
     # --- 2. Parakeet ASR с таймстампами ---
-    progress(0.15, desc="Загрузка ASR модели (первый раз ~670 MB)...")
-    emit("▶ Загружаю Parakeet TDT 0.6B v3 INT8 (если первый запуск — качает ~670 MB)...")
+    progress(0.15, desc="Loading the ASR model (first run: ~670 MB)...")
+    emit("▶ Loading Parakeet TDT 0.6B v3 INT8 (first run downloads ~670 MB)...")
     yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
     try:
         asr = get_asr_model()
     except Exception as exc:
-        emit(f"❌ Ошибка загрузки ASR: {exc}")
+        emit(f"❌ Could not load the ASR model: {exc}")
         yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
         return
 
-    progress(0.30, desc="Транскрипция (Parakeet + VAD)...")
-    emit("▶ Запускаю распознавание через VAD (Silero) → Parakeet посегментно...")
+    progress(0.30, desc="Transcribing with Parakeet + VAD...")
+    emit("▶ Running Silero VAD and Parakeet transcription...")
     yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
     try:
         result_iter = asr.recognize(str(full_wav))
     except Exception as exc:
-        emit(f"❌ Ошибка распознавания: {exc}")
+        emit(f"❌ Transcription failed: {exc}")
         yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
         return
 
@@ -984,42 +1241,62 @@ def auto_prepare_dataset(
                 # VAD-сегмент целиком — это 1 клип
                 segments.append({"start": seg_start, "end": seg_end, "text": seg_text})
             else:
-                # Длинный VAD-сегмент — режем по внутренним словам (предложениям)
-                seg_words = _extract_words_from_result(seg)
-                if not seg_words:
-                    continue
-                sub_segs, _ = segment_by_sentences(
-                    seg_words,
-                    min_sec=min_sec, max_sec=max_sec,
-                    target_min=target_min, target_max=target_max,
+                # onnx-asr VAD token timestamps are segment-relative. Convert
+                # them to full-file time before building a contiguous no-drop
+                # split plan. If timestamps are unavailable, the helper uses
+                # deterministic synthetic spans for every transcript token.
+                try:
+                    timed_words = list(extract_absolute_words_from_timestamped_segment(seg))
+                except Exception:
+                    timed_words = []
+                sub_segs, split_audit = _split_asr_segment_no_drop(
+                    seg_start=seg_start,
+                    seg_end=seg_end,
+                    seg_text=seg_text,
+                    words=timed_words,
+                    max_sec=max_sec,
+                    target_max=target_max,
                 )
+                if split_audit.get("textless_duration_sec", 0.0) > 0:
+                    emit(
+                        f"  ℹ {split_audit['textless_duration_sec']:.2f} sec silence "
+                        "was accounted for outside text-conditioned clips"
+                    )
                 segments.extend(sub_segs)
     except Exception as exc:
-        emit(f"❌ Ошибка разбора результата: {exc}")
+        emit(f"❌ Could not parse the transcription result: {exc}")
         import traceback; traceback.print_exc()
         yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
         return
 
     if not segments:
-        emit("❌ Не удалось получить валидных сегментов")
+        emit("❌ No valid speech segments were produced")
         yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
         return
 
     seg_total = sum(s['end'] - s['start'] for s in segments)
     vad_coverage_pct = seg_total / max(duration, 1) * 100
-    emit(f"✓ {len(segments)} клипов, чистой речи {seg_total:.1f} сек ({vad_coverage_pct:.0f}% от входа)")
+    emit(
+        f"✓ {len(segments)} clips, {seg_total:.1f} sec of speech "
+        f"({vad_coverage_pct:.0f}% of the input)"
+    )
 
-    # --- 3. Финальная фильтрация (min_sec) ---
-    progress(0.70, desc="Фильтрация коротких...")
-    before = len(segments)
-    segments = [s for s in segments if (s["end"] - s["start"]) >= min_sec]
-    if before != len(segments):
-        emit(f"  (отброшено {before - len(segments)} клипов короче {min_sec:.1f} сек)")
+    # --- 3. Final validation (short speech clips are retained) ---
+    progress(0.70, desc="Validating clips...")
+    short_count = sum(
+        1 for segment in segments
+        if 0 < (segment["end"] - segment["start"]) < min_sec
+    )
+    if short_count:
+        emit(
+            f"  ℹ Retaining {short_count} speech clips shorter than {min_sec:.1f} sec "
+            "so no recognized speech is silently discarded"
+        )
     yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
 
     # --- 4. Резка WAV + сохранение ---
-    progress(0.80, desc="Сохранение клипов...")
-    emit("▶ Сохраняю клипы и транскрипты...")
+    progress(0.80, desc="Saving clips...")
+    emit("▶ Saving clips and transcripts...")
     wav, sr = sf.read(str(full_wav))
     if wav.ndim > 1:
         wav = wav[:, 0]
@@ -1032,11 +1309,12 @@ def auto_prepare_dataset(
     # и чуть-чуть «продышать» клип (VoxCPM лучше тренируется на клипах с естественными краями)
     PAD_SEC = 0.10
     for idx, seg in enumerate(segments):
-        s_sample = max(0, int((seg["start"] - PAD_SEC) * sr))
-        e_sample = min(len(wav), int((seg["end"] + PAD_SEC) * sr))
+        edge_padding = 0.0 if seg.get("_exact_bounds") else PAD_SEC
+        s_sample = max(0, int((seg["start"] - edge_padding) * sr))
+        e_sample = min(len(wav), int((seg["end"] + edge_padding) * sr))
         clip = wav[s_sample:e_sample]
         dur = len(clip) / sr if sr else 0
-        if dur < min_sec:
+        if dur <= 0:
             skipped += 1
             continue
         fname = f"clip_{idx:04d}.wav"
@@ -1047,7 +1325,7 @@ def auto_prepare_dataset(
         saved_durations.append(dur)
 
     if not saved_paths:
-        emit("❌ Все клипы оказались слишком короткими")
+        emit("❌ No non-empty clips remained after slicing")
         yield "\n".join(log), "", None, gr.update(), gr.update(), gr.update(), gr.update()
         return
 
@@ -1056,9 +1334,12 @@ def auto_prepare_dataset(
 
     # Чистая речь = сумма длительностей сохранённых клипов (после сегментации и фильтрации)
     total_dur = sum(saved_durations)
-    emit(f"✓ Сохранено {len(saved_paths)} клипов, чистой речи {total_dur:.1f} сек ({total_dur/60:.1f} мин)")
+    emit(
+        f"✓ Saved {len(saved_paths)} clips, {total_dur:.1f} sec of speech "
+        f"({total_dur/60:.1f} min)"
+    )
     if skipped:
-        emit(f"  (отброшено {skipped} коротких после обрезки тишины)")
+        emit(f"  Skipped {skipped} empty clips after trimming")
 
     # Удаляем промежуточный full wav
     try: full_wav.unlink()
@@ -1080,26 +1361,29 @@ def auto_prepare_dataset(
     except Exception:
         pass
 
-    progress(0.95, desc="Готово")
-    emit(f"\n✅ Датасет готов: train_data/{name}/")
-    emit(f"   Транскрипты: train_data/{name}/transcripts.txt")
-    emit(f"   Аудио: train_data/{name}/audio/*.wav")
+    progress(0.95, desc="Done")
+    emit(f"\n✅ Dataset ready: train_data/{name}/")
+    emit(f"   Transcripts: train_data/{name}/transcripts.txt")
+    emit(f"   Audio: train_data/{name}/audio/*.wav")
 
     # --- Авто-тюнинг настроек LoRA на основе размера датасета ---
     if auto_tune:
         ar, aa, asteps, alr, reason = recommend_lora_settings(len(saved_paths), total_dur)
-        emit(f"\n📊 Авто-тюнинг настроек LoRA:")
+        emit("\n📊 Auto-tuned LoRA settings:")
         emit(f"   {reason}")
         emit(f"   → r={ar}, α={aa}, steps={asteps}, lr={alr}")
-        emit("   (отключи галочку «Авто-тюнинг» если хочешь свои значения из слайдеров выше)")
+        emit("   Clear Auto-tune to use the slider values instead.")
         r, alpha, steps, lr = ar, aa, asteps, alr
     else:
-        emit(f"\nℹ Авто-тюнинг выключен — используются значения слайдеров: r={r}, α={alpha}, steps={steps}, lr={lr}")
+        emit(
+            f"\nℹ Auto-tune is off; using slider values: "
+            f"r={r}, α={alpha}, steps={steps}, lr={lr}"
+        )
 
     if start_training:
-        emit("\n🎓 Галочка «Запустить обучение» стоит — обучение стартует сразу после. Смотри «Лог тренировки» ниже.")
+        emit("\n🎓 Automatic training is enabled and will start next; see the training log below.")
     else:
-        emit("\nℹ Переключись на вкладку «Ручное обучение» — там файлы и транскрипты уже заполнены, жми «Начать обучение» когда готов.")
+        emit("\nℹ The generated files and transcripts are ready for manual training below.")
     yield (
         "\n".join(log), transcripts_text, saved_paths,
         gr.update(value=r), gr.update(value=alpha),
@@ -1111,17 +1395,26 @@ def maybe_auto_train(
     start_training: bool,
     name: str, files, transcripts: str,
     r: int, alpha: int, steps: int, lr: float,
+    vram_profile: str = "8gb",
     progress=gr.Progress(),
 ):
     """Отдельный процесс тренировки. Запускается через .then() после auto_prepare_dataset.
     Если галочка «запустить после подготовки» не стояла — мгновенно выходит."""
     if not start_training:
         return
-    for line in train_lora(name, files, transcripts, r, alpha, steps, lr, progress=progress):
+    for line in train_lora(
+        name, files, transcripts, r, alpha, steps, lr,
+        vram_profile=vram_profile, progress=progress,
+    ):
         yield line
 
 
-def prepare_train_data(name: str, files: list, transcripts_text: str) -> tuple[Path, int]:
+def prepare_train_data(
+    name: str,
+    files: list,
+    transcripts_text: str,
+    max_audio_seconds: float = 0.0,
+) -> tuple[Path, int]:
     """
     Подготовить датасет для обучения:
     - files: список временных путей к wav/mp3/flac из gr.File
@@ -1148,13 +1441,89 @@ def prepare_train_data(name: str, files: list, transcripts_text: str) -> tuple[P
         src = Path(src)
         if not src.exists():
             continue
-        dst = audio_dir / src.name
-        if not dst.exists():
-            shutil.copy2(str(src), str(dst))
         tx = tr_map.get(src.name) or tr_map.get(src.stem) or ""
         if not tx:
             continue  # без транскрипта пропускаем
-        manifest.append({"audio": str(dst), "text": tx})
+
+        source_duration = _ffprobe_duration(str(src))
+        # Auto-prepared standalone clips may include 100 ms context on each
+        # edge. Treat that intentional padding as within the profile limit.
+        if not max_audio_seconds or source_duration <= max_audio_seconds + 0.5:
+            dst = audio_dir / src.name
+            if not dst.exists():
+                shutil.copy2(str(src), str(dst))
+            item = {"audio": str(dst), "text": tx}
+            if source_duration > 0:
+                item["duration"] = source_duration
+            manifest.append(item)
+            continue
+
+        # Oversized manual files are aligned once with the existing ASR, then
+        # sliced on exact shared boundaries. The user's transcript remains
+        # authoritative and every whitespace token is assigned exactly once.
+        safe_stem = "".join(
+            character if character.isalnum() or character in "-_" else "_"
+            for character in src.stem
+        ) or "manual"
+        converted = audio_dir / f"_{safe_stem}_source_16k.wav"
+        if not extract_audio_16k_mono(str(src), converted):
+            raise RuntimeError(f"Could not convert oversized training file: {src}")
+
+        converted_info = sf.info(str(converted))
+        exact_duration = converted_info.frames / float(converted_info.samplerate)
+        timed_words = []
+        try:
+            for asr_segment in get_asr_model().recognize(str(converted)):
+                try:
+                    timed_words.extend(
+                        extract_absolute_words_from_timestamped_segment(asr_segment)
+                    )
+                except Exception:
+                    continue
+        except Exception as exc:
+            print(f"[manual split] ASR alignment fallback for {src.name}: {exc}")
+
+        if not timed_words:
+            source_tokens = [token for token in tx.split() if token]
+            if not source_tokens:
+                raise RuntimeError(f"Transcript is empty for oversized file: {src}")
+            timed_words = []
+            for index, token in enumerate(source_tokens):
+                timed_words.append({
+                    "text": token,
+                    "start": exact_duration * index / len(source_tokens),
+                    "end": exact_duration * (index + 1) / len(source_tokens),
+                })
+
+        plan = plan_no_drop_splits(
+            timed_words,
+            source_start=0.0,
+            source_end=exact_duration,
+            max_part_sec=max_audio_seconds,
+            target_part_sec=max_audio_seconds,
+        )
+        validate_split_plan(plan, allow_textless_parts=True)
+        weights = [float(len(part.fragments)) for part in plan.parts]
+        child_transcripts = partition_transcript(tx, weights)
+        slices = slice_audio_file(
+            converted,
+            audio_dir,
+            plan,
+            prefix=f"{safe_stem}_part",
+        )
+        for sliced, child_text in zip(slices, child_transcripts):
+            if not child_text:
+                continue  # accounted silence-only interval, not speech data
+            manifest.append({
+                "audio": str(sliced.path),
+                "text": child_text,
+                "duration": sliced.frames / float(sliced.sample_rate),
+                "source_audio": str(src),
+            })
+        try:
+            converted.unlink()
+        except OSError:
+            pass
 
     manifest_path = ds_dir / "train.jsonl"
     with open(manifest_path, "w", encoding="utf-8") as f:
@@ -1163,95 +1532,205 @@ def prepare_train_data(name: str, files: list, transcripts_text: str) -> tuple[P
     return manifest_path, len(manifest)
 
 
-def train_lora(name, files, transcripts, r, alpha, steps, lr, progress=gr.Progress()):
-    """Запустить обучение LoRA. Yield-генератор для live log."""
-    import subprocess, yaml, json
-    if not name or not name.strip():
-        yield "❌ Укажи имя LoRA (имя папки-результата)"
-        return
-    name = name.strip().replace(" ", "_")
-
-    if not files:
-        yield "❌ Загрузите аудио-файлы для тренировки"
-        return
-
-    train_script = get_training_script()
-    if train_script is None:
-        yield "❌ training/scripts/train_voxcpm_finetune.py не найден"
-        return
-
-    progress(0.1, desc="Готовлю датасет...")
-    manifest, n = prepare_train_data(name, files, transcripts)
-    if n == 0:
-        yield "❌ Нет валидных сэмплов. Проверь транскрипты (формат: имя_файла.wav|текст)"
-        return
-    yield f"✓ Dataset: {n} сэмплов → {manifest}"
-
-    save_path = LORA_DIR / name
-    # Если папка уже существует — чистим (иначе train-скрипт пытается возобновиться
-    # со старого чекпоинта, а если r/alpha изменились, ловим size mismatch)
-    if save_path.exists():
-        import shutil
-        try:
-            shutil.rmtree(save_path)
-            yield f"🧹 Очистил старый чекпоинт {save_path}"
-        except Exception as exc:
-            yield f"⚠ Не смог удалить {save_path}: {exc}"
-    save_path.mkdir(parents=True, exist_ok=True)
-    config_path = TRAIN_DATA_DIR / name / "train_config.yaml"
-
-    # Путь к уже скачанному VoxCPM2 (в models/ через HF cache)
-    # Ищем snapshot
-    from huggingface_hub import snapshot_download
+def build_lora_training_config(
+    *,
+    pretrained,
+    manifest,
+    save_path,
+    sample_count,
+    r,
+    alpha,
+    steps,
+    lr,
+    vram_profile,
+) -> dict:
+    """Build the complete reproducible trainer config without side effects."""
+    profile_name, profile = _resolve_vram_profile(vram_profile)
+    rank, alpha_value, step_count, learning_rate = validate_lora_hyperparameters(
+        r, alpha, steps, lr
+    )
     try:
-        pretrained = snapshot_download("openbmb/VoxCPM2", local_files_only=True)
-    except Exception:
-        pretrained = snapshot_download("openbmb/VoxCPM2")
+        sample_count = int(sample_count)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Training sample count must be a positive integer") from exc
+    if sample_count < 1:
+        raise ValueError("Training sample count must be a positive integer")
 
-    # grad_accum адаптивный (общий для recommender и трена)
-    n_files_for_config = len(files) if files else 20
-    grad_accum = _pick_grad_accum(n_files_for_config)
-
-    cfg = {
-        "pretrained_path": pretrained,
+    # Preserve the recommender's effective batch when the fast profile doubles
+    # the micro-batch, so profile selection changes speed rather than epochs.
+    grad_accum = max(
+        1,
+        _pick_grad_accum(sample_count) // int(profile["batch_size"]),
+    )
+    return {
+        "pretrained_path": str(pretrained),
         "train_manifest": str(manifest),
-        "sample_rate": 16000,  # AudioVAE encodes 16kHz (issue #202 fix)
+        "sample_rate": 16000,
         "out_sample_rate": 48000,
-        "batch_size": 1,
+        "batch_size": profile["batch_size"],
         "grad_accum_steps": grad_accum,
         "num_workers": 0,
-        "num_iters": int(steps),
+        "num_iters": step_count,
         "log_interval": 10,
-        "valid_interval": max(100, int(steps) // 2),
-        "save_interval": max(100, int(steps) // 2),
-        "learning_rate": float(lr),
+        "valid_interval": max(100, step_count // 2),
+        "save_interval": max(100, step_count // 2),
+        "learning_rate": learning_rate,
         "weight_decay": 0.01,
-        "warmup_steps": min(100, int(steps) // 10),
-        "max_steps": int(steps),
-        "max_batch_tokens": 8192,
+        "warmup_steps": min(100, step_count // 10),
+        "max_steps": step_count,
+        "max_batch_tokens": profile["max_batch_tokens"],
+        "vram_profile": profile_name,
+        "gradient_checkpointing": profile["gradient_checkpointing"],
+        "max_sample_tokens": profile["max_sample_tokens"],
+        "split_oversized_samples": profile["split_oversized_samples"],
+        "vram_safety_margin_mb": profile["vram_safety_margin_mb"],
         "save_path": str(save_path),
         "lambdas": {"loss/diff": 1.0, "loss/stop": 1.0},
         "lora": {
             "enable_lm": True,
             "enable_dit": True,
             "enable_proj": False,
-            "r": int(r),
-            "alpha": int(alpha),
+            "r": rank,
+            "alpha": alpha_value,
             "dropout": 0.0,
         },
     }
+
+
+def train_lora(
+    name, files, transcripts, r, alpha, steps, lr,
+    vram_profile: str = "8gb", local_audio_path: str = "",
+    progress=gr.Progress(),
+):
+    """Запустить обучение LoRA. Yield-генератор для live log."""
+    import subprocess, yaml
+    try:
+        name = _normalize_lora_run_name(name)
+        profile_name, profile = _resolve_vram_profile(vram_profile)
+        r, alpha, steps, lr = validate_lora_hyperparameters(r, alpha, steps, lr)
+    except ValueError as exc:
+        yield f"❌ {exc}"
+        return
+
+    if not files and local_audio_path and str(local_audio_path).strip():
+        try:
+            files = [
+                str(path)
+                for path in resolve_audio_files(local_audio_path, base_dir=SCRIPT_DIR)
+            ]
+            if not str(transcripts or "").strip():
+                transcripts = read_transcripts(
+                    local_audio_path,
+                    base_dir=SCRIPT_DIR,
+                ) or ""
+        except LocalMediaError as exc:
+            yield f"❌ {exc}"
+            return
+        yield f"✓ Local path resolved to {len(files)} audio file(s)"
+
+    if not files:
+        yield "❌ Upload audio files or paste a local audio file/folder path"
+        return
+
+    train_script = get_training_script()
+    if train_script is None:
+        yield "❌ training/scripts/train_voxcpm_finetune.py was not found"
+        return
+
+    try:
+        persist_vram_profile(profile_name)
+    except OSError as exc:
+        # A read-only cache must not prevent an otherwise valid local run.
+        print(f"[VRAM] Could not persist profile selection: {exc}")
+
+    progress(0.1, desc="Preparing the dataset...")
+    try:
+        manifest, n = prepare_train_data(
+            name,
+            files,
+            transcripts,
+            max_audio_seconds=profile["max_audio_seconds"],
+        )
+    except Exception as exc:
+        yield f"❌ Could not prepare the dataset: {exc}"
+        return
+    if n == 0:
+        yield (
+            "❌ No valid samples. Check transcripts.txt or the transcript box "
+            "(format: filename.wav|text)"
+        )
+        return
+    yield f"✓ Dataset: {n} samples → {manifest}"
+
+    save_path = LORA_DIR / name
+    config_path = TRAIN_DATA_DIR / name / "train_config.yaml"
+
+    # Путь к уже скачанному VoxCPM2 (в models/ через HF cache)
+    # Ищем snapshot
+    from huggingface_hub import snapshot_download
+    try:
+        try:
+            pretrained = snapshot_download("openbmb/VoxCPM2", local_files_only=True)
+        except Exception:
+            pretrained = snapshot_download("openbmb/VoxCPM2")
+    except Exception as exc:
+        yield f"❌ Could not find or download the VoxCPM2 base model: {exc}"
+        return
+
+    cfg = build_lora_training_config(
+        pretrained=pretrained,
+        manifest=manifest,
+        save_path=save_path,
+        sample_count=n,
+        r=r,
+        alpha=alpha,
+        steps=steps,
+        lr=lr,
+        vram_profile=profile_name,
+    )
+
+    # If a new rank/alpha was selected, resuming an older checkpoint would
+    # produce a shape mismatch.  Abort on cleanup failure instead of silently
+    # continuing with incompatible state.
+    if save_path.exists():
+        import shutil
+        try:
+            shutil.rmtree(save_path)
+            yield f"🧹 Removed the previous checkpoint at {save_path}"
+        except Exception as exc:
+            yield f"❌ Could not remove the previous checkpoint at {save_path}: {exc}"
+            return
+    save_path.mkdir(parents=True, exist_ok=True)
+
     with open(config_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, allow_unicode=True)
     yield f"✓ Config: {config_path}"
-    yield f"Запуск тренировки (steps={steps}, r={r}, α={alpha}, lr={lr})..."
+    yield (
+        f"✓ VRAM profile: {profile_name} | batch={profile['batch_size']}, "
+        f"sample cap={profile['max_sample_tokens']} tokens, "
+        f"checkpointing={'on' if profile['gradient_checkpointing'] else 'off'}, "
+        f"safety margin={profile['vram_safety_margin_mb']} MB"
+    )
+    yield f"Starting training (steps={steps}, r={r}, α={alpha}, lr={lr})..."
 
-    progress(0.15, desc="Старт тренировки...")
+    progress(0.15, desc="Starting training...")
+
+    # The trainer is a separate CUDA process.  Release both PyTorch inference
+    # state and ONNX Runtime ASR state first, otherwise their allocations remain
+    # visible to the child and can consume most of an 8 GB card.
+    memory_status = release_training_gpu_memory()
+    yield f"🧹 {memory_status}"
 
     # PYTHONUNBUFFERED=1 + -u = принудительный flush после каждой строки,
     # иначе Python subprocess буферит stdout при пайпе и UI не видит прогресс
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+    alloc_conf = env.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    if "expandable_segments:" not in alloc_conf:
+        env["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(
+            part for part in (alloc_conf, "expandable_segments:True") if part
+        )
     proc = subprocess.Popen(
-        [sys.executable, "-u", str(train_script), "--config_path", str(config_path)],
+        build_training_command(sys.executable, train_script, config_path),
         cwd=str(TRAINING_DIR),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         env=env, text=True, encoding="utf-8", errors="replace", bufsize=1,
@@ -1274,10 +1753,10 @@ def train_lora(name, files, transcripts, r, alpha, steps, lr, progress=gr.Progre
         yield "\n".join(log_lines[-40:])
     proc.wait()
     if proc.returncode == 0:
-        progress(1.0, desc="Готово")
-        log_lines.append(f"\n✅ Готово! LoRA сохранена в {save_path}")
+        progress(1.0, desc="Done")
+        log_lines.append(f"\n✅ Done! LoRA saved to {save_path}")
     else:
-        log_lines.append(f"\n❌ Тренировка завершилась с кодом {proc.returncode}")
+        log_lines.append(f"\n❌ Training exited with code {proc.returncode}")
     yield "\n".join(log_lines[-60:])
 
 
@@ -1303,7 +1782,7 @@ def download_selected_voices(selected):
 def _detect_device() -> tuple[str, str]:
     if torch.cuda.is_available():
         name = torch.cuda.get_device_name(0)
-        vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+        vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
         return "cuda", f"{name} | VRAM: {vram:.1f} GB"
     return "cpu", "CPU (экспериментально / experimental — very slow)"
 
@@ -2058,6 +2537,8 @@ I18N = gr.I18n(
         "lora_auto_title": "🎬 Auto-prepare dataset from video/audio",
         "lora_auto_desc": "Upload a long video/audio file — it will be automatically split into meaningful clips (whole sentences/paragraphs), transcribed via Parakeet TDT 0.6B v3 INT8 (~670 MB, downloads on first use), and (optionally) used to train a LoRA.",
         "lora_auto_file": "Video or audio file",
+        "lora_auto_local_path": "Or paste a local media file path",
+        "info_lora_auto_local_path": "Equivalent to dropping one file above; uploads take priority when both are set.",
         "lora_auto_name": "Dataset / LoRA name",
         "lora_auto_min_sec": "Min clip (sec)",
         "lora_auto_max_sec": "Max clip (sec)",
@@ -2089,11 +2570,23 @@ I18N = gr.I18n(
         # --- UI labels (was hardcoded) ---
         "label_examples": "Examples",
         "label_audio_files": "Audio files (wav/mp3/flac/m4a)",
+        "lora_manual_local_path": "Or paste a local audio file/folder path",
+        "info_lora_manual_local_path": "Equivalent to selecting files above. A folder uses its supported audio files and reads transcripts.txt when present.",
         "label_transcripts": "Transcripts (format: filename|text)",
         "label_lora_r": "LoRA rank (r)",
         "label_lora_alpha": "LoRA alpha",
         "label_lora_steps": "Training steps",
         "label_lora_lr": "Learning rate",
+        "label_vram_profile": "GPU VRAM profile",
+        "vram_profile_8gb": "8 GB — safe",
+        "vram_profile_12gb": "12 GB — balanced",
+        "vram_profile_16gb": "16 GB — balanced",
+        "vram_profile_over_16gb": ">16 GB — max speed (unrestricted)",
+        "info_vram_profile": "Manual choice. Lower-VRAM profiles cap sample length and enable memory savings; larger cards are never forced into the 8 GB limits.",
+        "vram_recommended_8gb": "Recommended starting profile for the detected GPU: **8 GB — safe**.",
+        "vram_recommended_12gb": "Recommended starting profile for the detected GPU: **12 GB — balanced**.",
+        "vram_recommended_16gb": "Recommended starting profile for the detected GPU: **16 GB — balanced**.",
+        "vram_recommended_over_16gb": "Recommended starting profile for the detected GPU: **>16 GB — max speed**.",
         "label_train_log": "Training log",
         "btn_train_start": "🎓 Start training",
         "lora_name_info": "Used for both dataset folder (train_data/<name>/) and LoRA folder (lora/<name>/)",
@@ -2169,6 +2662,8 @@ I18N = gr.I18n(
         "lora_auto_title": "🎬 Авто-подготовка датасета из видео/аудио",
         "lora_auto_desc": "Загрузи длинное видео или аудио — программа автоматически нарежет его на осмысленные куски (целые предложения / абзацы), распознает через Parakeet TDT 0.6B v3 INT8 (~670 MB, скачается при первом использовании) и (опционально) сразу запустит обучение LoRA.",
         "lora_auto_file": "Видео или аудио",
+        "lora_auto_local_path": "Или вставьте локальный путь к медиафайлу",
+        "info_lora_auto_local_path": "Работает как перетаскивание одного файла; загруженный файл имеет приоритет.",
         "lora_auto_name": "Имя датасета / LoRA",
         "lora_auto_min_sec": "Мин клип (сек)",
         "lora_auto_max_sec": "Макс клип (сек)",
@@ -2202,11 +2697,23 @@ I18N = gr.I18n(
         # --- UI labels ---
         "label_examples": "Примеры",
         "label_audio_files": "Аудиофайлы (wav/mp3/flac/m4a)",
+        "lora_manual_local_path": "Или вставьте локальный путь к аудиофайлу/папке",
+        "info_lora_manual_local_path": "Работает как выбор файлов выше. Для папки используются поддерживаемые аудиофайлы и transcripts.txt, если он есть.",
         "label_transcripts": "Транскрипты (формат: имя_файла|текст)",
         "label_lora_r": "LoRA ранг (r)",
         "label_lora_alpha": "LoRA alpha",
         "label_lora_steps": "Шагов обучения",
         "label_lora_lr": "Learning rate",
+        "label_vram_profile": "Профиль видеопамяти GPU",
+        "vram_profile_8gb": "8 ГБ — безопасный",
+        "vram_profile_12gb": "12 ГБ — сбалансированный",
+        "vram_profile_16gb": "16 ГБ — сбалансированный",
+        "vram_profile_over_16gb": ">16 ГБ — максимальная скорость (без ограничений)",
+        "info_vram_profile": "Выбирается вручную. Профили с меньшей VRAM ограничивают длину и экономят память; мощные GPU не получают ограничения профиля 8 ГБ.",
+        "vram_recommended_8gb": "Рекомендуемый стартовый профиль для обнаруженного GPU: **8 ГБ — безопасный**.",
+        "vram_recommended_12gb": "Рекомендуемый стартовый профиль для обнаруженного GPU: **12 ГБ — сбалансированный**.",
+        "vram_recommended_16gb": "Рекомендуемый стартовый профиль для обнаруженного GPU: **16 ГБ — сбалансированный**.",
+        "vram_recommended_over_16gb": "Рекомендуемый стартовый профиль для обнаруженного GPU: **>16 ГБ — максимальная скорость**.",
         "label_train_log": "Лог тренировки",
         "btn_train_start": "🎓 Начать обучение",
         "lora_name_info": "Используется и для папки датасета (train_data/<имя>/), и для папки LoRA (lora/<имя>/)",
@@ -2459,6 +2966,12 @@ def build_ui():
                         ".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus",
                     ],
                 )
+                auto_local_media_path = gr.Textbox(
+                    label=I18N("lora_auto_local_path"),
+                    info=I18N("info_lora_auto_local_path"),
+                    placeholder=r"C:\path\to\recording.mp3",
+                    lines=1,
+                )
                 with gr.Accordion(I18N("lora_auto_params"), open=False):
                     with gr.Row():
                         auto_min_sec = gr.Slider(1.0, 5.0, value=2.0, step=0.5, label=I18N("lora_auto_min_sec"), info=I18N("info_auto_min_sec"))
@@ -2484,8 +2997,14 @@ def build_ui():
                 gr.Markdown(I18N("lora_manual_desc"))
                 lora_files = gr.Files(
                     label=I18N("label_audio_files"),
-                    file_types=[".wav", ".mp3", ".flac", ".m4a", ".ogg"],
+                    file_types=[".wav", ".mp3", ".flac", ".m4a", ".ogg", ".opus"],
                     file_count="multiple",
+                )
+                lora_local_audio_path = gr.Textbox(
+                    label=I18N("lora_manual_local_path"),
+                    info=I18N("info_lora_manual_local_path"),
+                    placeholder=r"C:\path\to\audio_folder",
+                    lines=1,
                 )
                 lora_transcripts = gr.Textbox(
                     label=I18N("label_transcripts"),
@@ -2496,6 +3015,16 @@ def build_ui():
             gr.Markdown("---")
             gr.Markdown(I18N("md_step2_title"))
             gr.Markdown(I18N("md_step2_note"))
+            recommended_profile = load_selected_vram_profile()
+            gr.Markdown(f"**GPU:** {DEVICE_INFO}")
+            gr.Markdown(I18N(f"vram_recommended_{recommended_profile}"))
+            lora_vram_profile = gr.Dropdown(
+                choices=VRAM_PROFILE_DROPDOWN_CHOICES,
+                value=recommended_profile,
+                label=I18N("label_vram_profile"),
+                info=I18N("info_vram_profile"),
+                interactive=True,
+            )
             with gr.Row():
                 lora_r = gr.Slider(8, 128, value=32, step=8, label=I18N("label_lora_r"), info=I18N("info_lora_r"))
                 lora_alpha = gr.Slider(8, 128, value=32, step=8, label=I18N("label_lora_alpha"), info=I18N("info_lora_alpha"))
@@ -2514,18 +3043,36 @@ def build_ui():
                     auto_min_sec, auto_max_sec, auto_target_min, auto_target_max,
                     auto_start_train, auto_tune_chk,
                     lora_r, lora_alpha, lora_steps, lora_lr,
+                    auto_local_media_path,
                 ],
                 outputs=[auto_log, lora_transcripts, lora_files, lora_r, lora_alpha, lora_steps, lora_lr],
+                api_name="auto_prepare_lora_dataset",
             ).then(
                 maybe_auto_train,
-                inputs=[auto_start_train, lora_name, lora_files, lora_transcripts, lora_r, lora_alpha, lora_steps, lora_lr],
+                inputs=[
+                    auto_start_train, lora_name, lora_files, lora_transcripts,
+                    lora_r, lora_alpha, lora_steps, lora_lr, lora_vram_profile,
+                ],
                 outputs=[lora_train_log],
+                api_name="auto_train_lora",
             )
 
             lora_train_btn.click(
                 train_lora,
-                inputs=[lora_name, lora_files, lora_transcripts, lora_r, lora_alpha, lora_steps, lora_lr],
+                inputs=[
+                    lora_name, lora_files, lora_transcripts,
+                    lora_r, lora_alpha, lora_steps, lora_lr, lora_vram_profile,
+                    lora_local_audio_path,
+                ],
                 outputs=[lora_train_log],
+                api_name="train_lora",
+            )
+            lora_vram_profile.change(
+                _persist_vram_profile_from_ui,
+                inputs=[lora_vram_profile],
+                outputs=[],
+                show_progress="hidden",
+                api_visibility="private",
             )
 
     return demo
