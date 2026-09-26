@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 
 import sys
+import gc
+import os
 from pathlib import Path
+
+# Must be set before the first CUDA allocation in this subprocess.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root / "src"))
+sys.path.insert(0, str(project_root))
+
+from vram_profiles import (
+    VRAM_PROFILES as SHARED_VRAM_PROFILES,
+    normalize_vram_profile as _normalize_shared_vram_profile,
+)
 
 import contextlib
 from typing import Dict
@@ -15,7 +26,6 @@ from tensorboardX import SummaryWriter
 from torch.optim import AdamW
 from transformers import get_cosine_schedule_with_warmup
 import signal
-import os
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -32,6 +42,7 @@ import json
 from voxcpm.model import VoxCPMModel, VoxCPM2Model
 from voxcpm.model.voxcpm import LoRAConfig as LoRAConfigV1
 from voxcpm.model.voxcpm2 import LoRAConfig as LoRAConfigV2
+from voxcpm.modules.minicpm4 import MiniCPMModel
 from voxcpm.training import (
     Accelerator,
     BatchProcessor,
@@ -39,6 +50,277 @@ from voxcpm.training import (
     build_dataloader,
     load_audio_text_datasets,
 )
+
+
+VRAM_PROFILE_DEFAULTS = {
+    name: {
+        "max_sample_tokens": int(values["max_sample_tokens"]),
+        "safety_margin_mb": int(values["vram_safety_margin_mb"]),
+        "checkpointing": bool(values["gradient_checkpointing"]),
+        "split_oversized_samples": bool(values["split_oversized_samples"]),
+    }
+    for name, values in SHARED_VRAM_PROFILES.items()
+}
+
+
+def normalize_vram_profile(value: str) -> str:
+    return _normalize_shared_vram_profile(value, allow_empty=True)
+
+
+def _resolve_memory_policy(
+    *,
+    profile: str,
+    batch_size: int,
+    max_batch_tokens: int,
+    gradient_checkpointing: bool | None,
+    max_sample_tokens: int,
+    vram_safety_margin_mb: int,
+    split_oversized_samples: bool | None = None,
+) -> dict:
+    """Apply profile defaults without overriding explicit zero values."""
+    defaults = VRAM_PROFILE_DEFAULTS.get(profile, {})
+    if isinstance(batch_size, bool) or int(batch_size) < 1:
+        raise ValueError("batch_size must be a positive integer")
+    batch_size = int(batch_size)
+    if isinstance(max_batch_tokens, bool) or int(max_batch_tokens) < 0:
+        raise ValueError("max_batch_tokens must be zero or a positive integer")
+    max_batch_tokens = int(max_batch_tokens)
+    if isinstance(max_sample_tokens, bool) or int(max_sample_tokens) < -1:
+        raise ValueError("max_sample_tokens must be -1, zero, or a positive integer")
+    max_sample_tokens = int(max_sample_tokens)
+    if isinstance(vram_safety_margin_mb, bool) or int(vram_safety_margin_mb) < -1:
+        raise ValueError("vram_safety_margin_mb must be -1, zero, or a positive integer")
+    vram_safety_margin_mb = int(vram_safety_margin_mb)
+    if gradient_checkpointing is None:
+        gradient_checkpointing = bool(defaults.get("checkpointing", False))
+    if split_oversized_samples is None:
+        split_oversized_samples = bool(defaults.get("split_oversized_samples", False))
+    if max_sample_tokens < 0:
+        max_sample_tokens = int(defaults.get("max_sample_tokens", 0)) if max_batch_tokens <= 0 else 0
+    if vram_safety_margin_mb < 0:
+        vram_safety_margin_mb = int(defaults.get("safety_margin_mb", 0))
+
+    batch_token_limit = max_batch_tokens // max(1, batch_size) if max_batch_tokens > 0 else 0
+    if max_sample_tokens > 0 and batch_token_limit > 0:
+        effective_max_sample_tokens = min(max_sample_tokens, batch_token_limit)
+    else:
+        effective_max_sample_tokens = max(max_sample_tokens, batch_token_limit)
+    if max_batch_tokens <= 0 and effective_max_sample_tokens > 0:
+        max_batch_tokens = effective_max_sample_tokens * max(1, batch_size)
+
+    return {
+        "gradient_checkpointing": bool(gradient_checkpointing),
+        "max_sample_tokens": max_sample_tokens,
+        "effective_max_sample_tokens": effective_max_sample_tokens,
+        "max_batch_tokens": max_batch_tokens,
+        "vram_safety_margin_mb": vram_safety_margin_mb,
+        "split_oversized_samples": bool(split_oversized_samples),
+    }
+
+
+def _install_memory_efficient_minicpm_forward():
+    """Patch the bundled MiniCPM class inside this training subprocess only.
+
+    The installed VoxCPM wheel predates training checkpointing and always retains
+    per-layer prefill K/V tensors. In training mode those tensors are unused.
+    """
+    if getattr(MiniCPMModel, "_voxcpm_training_memory_patch", False):
+        return
+
+    from torch.utils.checkpoint import checkpoint
+
+    def forward(self, inputs_embeds, is_causal=True, use_cache=None):
+        if use_cache is None:
+            use_cache = not self.training
+        if self.rope_emb is not None:
+            position_ids = torch.arange(0, inputs_embeds.size(1), dtype=torch.long, device=inputs_embeds.device)
+            position_emb = self.rope_emb(position_ids)
+        else:
+            position_emb = None
+        hidden_states = inputs_embeds
+        next_decoder_cache = []
+
+        for decoder_layer in self.layers:
+            checkpoint_active = (
+                getattr(self, "gradient_checkpointing", False)
+                and self.training
+                and torch.is_grad_enabled()
+            )
+            if checkpoint_active:
+                if use_cache:
+                    hidden_states, this_cache = checkpoint(
+                        decoder_layer,
+                        hidden_states,
+                        position_emb,
+                        is_causal,
+                        use_reentrant=False,
+                    )
+                else:
+                    def layer_forward(states, layer=decoder_layer):
+                        return layer(states, position_emb, is_causal)[0]
+
+                    hidden_states = checkpoint(layer_forward, hidden_states, use_reentrant=False)
+                    this_cache = None
+            else:
+                hidden_states, this_cache = decoder_layer(hidden_states, position_emb, is_causal)
+            if use_cache:
+                next_decoder_cache.append(this_cache)
+
+        return self.norm(hidden_states), next_decoder_cache
+
+    def gradient_checkpointing_enable(self):
+        self.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self):
+        self.gradient_checkpointing = False
+
+    MiniCPMModel.forward = forward
+    MiniCPMModel.gradient_checkpointing_enable = gradient_checkpointing_enable
+    MiniCPMModel.gradient_checkpointing_disable = gradient_checkpointing_disable
+    MiniCPMModel._voxcpm_training_memory_patch = True
+
+
+@contextlib.contextmanager
+def _suppress_constructor_kv_caches():
+    """Prevent VoxCPM constructors from allocating 8192-token inference caches."""
+    original_setup_cache = MiniCPMModel.setup_cache
+
+    def no_training_cache(module, *args, **kwargs):
+        module.kv_cache = None
+
+    MiniCPMModel.setup_cache = no_training_cache
+    try:
+        yield
+    finally:
+        MiniCPMModel.setup_cache = original_setup_cache
+
+
+def _prepare_training_dtypes(model, keep_lora_fp32: bool) -> tuple[int, int]:
+    """Cast the frozen backbone to its configured dtype before moving to CUDA."""
+    target_dtype = model._dtype()
+    audio_vae = model.audio_vae
+    model.audio_vae = None
+    model.to(dtype=target_dtype)
+    model.audio_vae = audio_vae.to(torch.float32)
+
+    if keep_lora_fp32:
+        for name, parameter in model.named_parameters():
+            if parameter.requires_grad and "lora_" in name:
+                parameter.data = parameter.data.to(torch.float32)
+
+    frozen_bytes = sum(p.numel() * p.element_size() for p in model.parameters() if not p.requires_grad)
+    trainable_bytes = sum(p.numel() * p.element_size() for p in model.parameters() if p.requires_grad)
+    return frozen_bytes, trainable_bytes
+
+
+def _set_gradient_checkpointing(model, enabled: bool) -> int:
+    count = 0
+    for module in model.modules():
+        if isinstance(module, MiniCPMModel):
+            if enabled:
+                module.gradient_checkpointing_enable()
+            else:
+                module.gradient_checkpointing_disable()
+            count += 1
+    return count
+
+
+def _ensure_inference_kv_caches(model) -> list:
+    """Lazily create caches only for validation audio generation."""
+    created = []
+    for module in (model.base_lm, model.residual_lm):
+        if module.kv_cache is None:
+            module.setup_cache(
+                batch_size=1,
+                max_length=model.config.max_length,
+                device=model.device,
+                dtype=model._dtype(),
+            )
+            created.append(module)
+    return created
+
+
+def _clear_inference_kv_caches(modules: list):
+    for module in modules:
+        module.kv_cache = None
+    if modules and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _cuda_memory_state(device) -> dict:
+    if not torch.cuda.is_available() or getattr(device, "type", str(device)) != "cuda":
+        return {}
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    return {
+        "free_gib": free_bytes / 2**30,
+        "total_gib": total_bytes / 2**30,
+        "allocated_gib": torch.cuda.memory_allocated(device) / 2**30,
+        "reserved_gib": torch.cuda.memory_reserved(device) / 2**30,
+        "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 2**30,
+    }
+
+
+def _log_cuda_memory(tracker, device, phase: str, step: int | None = None) -> dict:
+    state = _cuda_memory_state(device)
+    if state:
+        step_text = f" step={step}" if step is not None else ""
+        tracker.print(
+            f"[CUDA]{step_text} {phase}: allocated={state['allocated_gib']:.2f} GiB, "
+            f"reserved={state['reserved_gib']:.2f} GiB, peak={state['peak_allocated_gib']:.2f} GiB, "
+            f"free={state['free_gib']:.2f}/{state['total_gib']:.2f} GiB"
+        )
+    return state
+
+
+def _raise_oversized_samples(lengths, limit: int, split_enabled: bool, manifest: str):
+    oversized = [(index, length) for index, length in enumerate(lengths) if length > limit]
+    if not oversized:
+        return
+    preview = ", ".join(f"#{index}={length}" for index, length in oversized[:8])
+    split_note = (
+        "Automatic splitting was requested, but preprocessing left oversized entries. "
+        if split_enabled
+        else "Enable split_oversized_samples in preprocessing. "
+    )
+    raise ValueError(
+        f"{len(oversized)} sample(s) in {manifest!r} exceed max_sample_tokens={limit} "
+        f"({preview}). {split_note}Training refuses to drop or silently truncate audio."
+    )
+
+
+def _abort_on_cuda_oom(
+    error,
+    *,
+    tracker,
+    device,
+    optimizer,
+    phase: str,
+    step: int,
+    micro_step: int,
+    sequence_tokens: int | None,
+    profile: str,
+    max_sample_tokens: int,
+    split_oversized_samples: bool,
+):
+    optimizer.zero_grad(set_to_none=True)
+    state = _log_cuda_memory(tracker, device, f"OOM during {phase}", step=step)
+    token_text = str(sequence_tokens) if sequence_tokens is not None else "unknown"
+    tracker.print(
+        "[CUDA OOM] Batch aborted safely; no optimizer step or checkpoint was written. "
+        f"phase={phase}, step={step}, micro_step={micro_step}, sequence_tokens={token_text}, "
+        f"vram_profile={profile or 'legacy'}, max_sample_tokens={max_sample_tokens or 'unrestricted'}, "
+        f"split_oversized_samples={split_oversized_samples}. "
+        "Re-run preprocessing with a lower max_sample_tokens value."
+    )
+    del error
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    free_text = f", free={state['free_gib']:.2f} GiB" if state else ""
+    raise RuntimeError(
+        f"CUDA out of memory during {phase} (step {step}, sequence_tokens={token_text}{free_text}). "
+        "The batch was not applied. Lower max_sample_tokens and split the source audio again."
+    ) from None
 
 
 @argbind.bind(without_prefix=True)
@@ -60,6 +342,11 @@ def train(
     warmup_steps: int = 1_000,
     max_steps: int = 100_000,
     max_batch_tokens: int = 0,
+    vram_profile: str = "",
+    gradient_checkpointing: bool = None,
+    max_sample_tokens: int = -1,
+    split_oversized_samples: bool = None,
+    vram_safety_margin_mb: int = -1,
     save_path: str = "checkpoints",
     tensorboard: str = "",
     lambdas: Dict[str, float] = {"loss/diff": 1.0, "loss/stop": 1.0},
@@ -72,10 +359,28 @@ def train(
 ):
     _ = config_path
 
+    profile = normalize_vram_profile(vram_profile)
+    policy = _resolve_memory_policy(
+        profile=profile,
+        batch_size=batch_size,
+        max_batch_tokens=max_batch_tokens,
+        gradient_checkpointing=gradient_checkpointing,
+        max_sample_tokens=max_sample_tokens,
+        vram_safety_margin_mb=vram_safety_margin_mb,
+        split_oversized_samples=split_oversized_samples,
+    )
+    gradient_checkpointing = policy["gradient_checkpointing"]
+    max_sample_tokens = policy["max_sample_tokens"]
+    effective_max_sample_tokens = policy["effective_max_sample_tokens"]
+    max_batch_tokens = policy["max_batch_tokens"]
+    vram_safety_margin_mb = policy["vram_safety_margin_mb"]
+    split_oversized_samples = policy["split_oversized_samples"]
+
     # Validate distribution options
     if lora is not None and distribute and not hf_model_id:
         raise ValueError("hf_model_id is required when distribute=True")
 
+    _install_memory_efficient_minicpm_forward()
     accelerator = Accelerator(amp=True)
 
     save_dir = Path(save_path)
@@ -89,6 +394,17 @@ def train(
 
     writer = SummaryWriter(log_dir=str(tb_dir)) if accelerator.rank == 0 else None
     tracker = TrainingTracker(writer=writer, log_file=str(save_dir / "train.log"), rank=accelerator.rank)
+    if accelerator.rank == 0:
+        tracker.print(
+            "Training memory policy: "
+            f"vram_profile={profile or 'legacy'}, batch_size={batch_size}, "
+            f"gradient_checkpointing={bool(gradient_checkpointing)}, "
+            f"max_sample_tokens={effective_max_sample_tokens or 'unrestricted'}, "
+            f"max_batch_tokens={max_batch_tokens or 'unrestricted'}, "
+            f"split_oversized_samples={bool(split_oversized_samples)}, "
+            f"vram_safety_margin_mb={vram_safety_margin_mb}"
+        )
+        _log_cuda_memory(tracker, accelerator.device, "before model load")
 
     # Auto-detect model architecture from config.json
     with open(os.path.join(pretrained_path, "config.json"), "r", encoding="utf-8") as _f:
@@ -97,9 +413,21 @@ def train(
     LoRAConfig = LoRAConfigV2 if _arch == "voxcpm2" else LoRAConfigV1
     if accelerator.rank == 0:
         print(f"Detected architecture: {_arch} -> {_model_cls.__name__}", file=sys.stderr)
-    base_model = _model_cls.from_local(
-        pretrained_path, optimize=False, training=True, lora_config=LoRAConfig(**lora) if lora else None
-    )
+    # VoxCPM allocates large static 8192-token K/V caches in its constructor,
+    # although full-sequence training never uses them. Suppress only while the
+    # training model is constructed; inference retains normal cache behaviour.
+    with _suppress_constructor_kv_caches():
+        base_model = _model_cls.from_local(
+            pretrained_path, optimize=False, training=True, lora_config=LoRAConfig(**lora) if lora else None
+        )
+    frozen_bytes, trainable_bytes = _prepare_training_dtypes(base_model, keep_lora_fp32=lora is not None)
+    checkpointed_modules = _set_gradient_checkpointing(base_model, bool(gradient_checkpointing))
+    if accelerator.rank == 0:
+        tracker.print(
+            f"CPU model prepared: frozen={frozen_bytes / 2**30:.2f} GiB in {base_model._dtype()}, "
+            f"trainable={trainable_bytes / 2**20:.1f} MiB, checkpointed_transformers={checkpointed_modules}, "
+            "inference_kv_cache=disabled"
+        )
     tokenizer = base_model.text_tokenizer
 
     expected_sr = base_model.audio_vae.sample_rate
@@ -129,13 +457,9 @@ def train(
     dataset_cnt = int(max(train_ds["dataset_id"])) + 1 if "dataset_id" in train_ds.column_names else 1
     num_train_samples = len(train_ds)
 
-    # ------------------------------------------------------------------ #
-    # Optional: filter samples by estimated token count to avoid OOM
-    # Enabled when max_batch_tokens > 0:
-    #   max_sample_len = max_batch_tokens // batch_size
-    #   Samples exceeding this length will be dropped
-    # ------------------------------------------------------------------ #
-    if max_batch_tokens and max_batch_tokens > 0:
+    # Validate before packing. Never drop or silently truncate speech.
+    validation_limit = effective_max_sample_tokens or int(base_model.config.max_length)
+    if validation_limit > 0:
         from voxcpm.training.data import compute_sample_lengths
 
         audio_vae_fps = base_model.audio_vae.sample_rate / base_model.audio_vae.hop_length
@@ -144,23 +468,19 @@ def train(
             audio_vae_fps=audio_vae_fps,
             patch_size=base_model.config.patch_size,
         )
-        max_sample_len = max_batch_tokens // batch_size if batch_size > 0 else max(est_lengths)
-        keep_indices = [i for i, L in enumerate(est_lengths) if L <= max_sample_len]
-
-        if len(keep_indices) < len(train_ds) and accelerator.rank == 0:
-            tracker.print(
-                f"Filtering {len(train_ds) - len(keep_indices)} / {len(train_ds)} "
-                f"training samples longer than {max_sample_len} tokens "
-                f"(max_batch_tokens={max_batch_tokens})."
-            )
-        train_ds = train_ds.select(keep_indices)
+        _raise_oversized_samples(
+            est_lengths,
+            min(validation_limit, int(base_model.config.max_length)),
+            bool(split_oversized_samples),
+            train_manifest,
+        )
 
     train_loader = build_dataloader(
         train_ds,
         accelerator=accelerator,
         batch_size=batch_size,
         num_workers=num_workers,
-        drop_last=True,
+        drop_last=False,
     )
     val_loader = (
         build_dataloader(
@@ -190,6 +510,15 @@ def train(
     model = accelerator.prepare_model(base_model)
     unwrapped_model = accelerator.unwrap(model)
     unwrapped_model.train()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(accelerator.device)
+    residency = _log_cuda_memory(tracker, accelerator.device, "model and AudioVAE resident")
+    if residency and vram_safety_margin_mb > 0 and residency["free_gib"] * 1024 < vram_safety_margin_mb:
+        raise RuntimeError(
+            f"Only {residency['free_gib'] * 1024:.0f} MiB VRAM remains after model load, below the "
+            f"configured safety margin of {vram_safety_margin_mb} MiB. Close other GPU applications "
+            "or select a lower VRAM profile."
+        )
 
     # Only print param info on rank 0 to avoid cluttered output
     if accelerator.rank == 0:
@@ -277,12 +606,33 @@ def train(
             resume["step"] = step
             tracker.step = step
             optimizer.zero_grad(set_to_none=True)
+            trace_cuda_phases = accelerator.rank == 0 and step == start_step
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(accelerator.device)
 
             # Gradient accumulation: accumulate gradients over micro-batches before optimizer step
             loss_dict = {}
             for micro_step in range(grad_accum_steps):
                 batch = get_next_batch()
-                processed = batch_processor(batch)
+                try:
+                    processed = batch_processor(batch)
+                except torch.OutOfMemoryError as error:
+                    _abort_on_cuda_oom(
+                        error,
+                        tracker=tracker,
+                        device=accelerator.device,
+                        optimizer=optimizer,
+                        phase="batch processing",
+                        step=step,
+                        micro_step=micro_step,
+                        sequence_tokens=None,
+                        profile=profile,
+                        max_sample_tokens=effective_max_sample_tokens,
+                        split_oversized_samples=bool(split_oversized_samples),
+                    )
+                sequence_tokens = int(processed["text_tokens"].shape[1])
+                if trace_cuda_phases:
+                    _log_cuda_memory(tracker, accelerator.device, "after batch processing", step=step)
 
                 # Only sync gradients on the last micro-batch
                 # Use no_sync() for intermediate steps to reduce communication overhead
@@ -290,29 +640,48 @@ def train(
                 sync_context = contextlib.nullcontext() if is_last_micro_step else accelerator.no_sync()
 
                 with sync_context:
-                    with accelerator.autocast(dtype=torch.bfloat16):
-                        outputs = model(
-                            processed["text_tokens"],
-                            processed["text_mask"],
-                            processed["audio_feats"],
-                            processed["audio_mask"],
-                            processed["loss_mask"],
-                            processed["position_ids"],
-                            processed["labels"],
-                            progress=step / max(1, num_iters),
+                    try:
+                        with accelerator.autocast(dtype=torch.bfloat16):
+                            outputs = model(
+                                processed["text_tokens"],
+                                processed["text_mask"],
+                                processed["audio_feats"],
+                                processed["audio_mask"],
+                                processed["loss_mask"],
+                                processed["position_ids"],
+                                processed["labels"],
+                                progress=step / max(1, num_iters),
+                            )
+                        if trace_cuda_phases:
+                            _log_cuda_memory(tracker, accelerator.device, "after forward", step=step)
+
+                        total_loss = 0.0
+                        for key, value in outputs.items():
+                            if key.startswith("loss/"):
+                                weight = lambdas.get(key, 1.0)
+                                loss_value = value * weight / grad_accum_steps
+                                total_loss = total_loss + loss_value
+                                # Record raw loss from last micro-batch for logging
+                                loss_dict[key] = value.detach()
+
+                        # Accumulate gradients (normalized by grad_accum_steps)
+                        accelerator.backward(total_loss)
+                        if trace_cuda_phases:
+                            _log_cuda_memory(tracker, accelerator.device, "after backward", step=step)
+                    except torch.OutOfMemoryError as error:
+                        _abort_on_cuda_oom(
+                            error,
+                            tracker=tracker,
+                            device=accelerator.device,
+                            optimizer=optimizer,
+                            phase="forward/backward",
+                            step=step,
+                            micro_step=micro_step,
+                            sequence_tokens=sequence_tokens,
+                            profile=profile,
+                            max_sample_tokens=effective_max_sample_tokens,
+                            split_oversized_samples=bool(split_oversized_samples),
                         )
-
-                    total_loss = 0.0
-                    for key, value in outputs.items():
-                        if key.startswith("loss/"):
-                            weight = lambdas.get(key, 1.0)
-                            loss_value = value * weight / grad_accum_steps
-                            total_loss = total_loss + loss_value
-                            # Record raw loss from last micro-batch for logging
-                            loss_dict[key] = value.detach()
-
-                    # Accumulate gradients (normalized by grad_accum_steps)
-                    accelerator.backward(total_loss)
 
             # After all micro-batches, do unscale / grad_norm / step
             scaler = getattr(accelerator, "scaler", None)
@@ -332,6 +701,12 @@ def train(
                 epoch = (step * grad_accum_steps * batch_size * accelerator.world_size) / max(1, num_train_samples)
                 loss_values["epoch"] = float(epoch)
                 loss_values["grad_norm"] = float(grad_norm)
+                cuda_state = _cuda_memory_state(accelerator.device)
+                if cuda_state:
+                    loss_values["vram/allocated_gib"] = cuda_state["allocated_gib"]
+                    loss_values["vram/reserved_gib"] = cuda_state["reserved_gib"]
+                    loss_values["vram/peak_allocated_gib"] = cuda_state["peak_allocated_gib"]
+                    loss_values["vram/free_gib"] = cuda_state["free_gib"]
                 tracker.log_metrics(loss_values, split="train")
 
             if val_loader is not None and (step % valid_interval == 0 or step == num_iters - 1):
@@ -585,9 +960,11 @@ def generate_sample_audio(
 
         # Preserve the original mode so validation failures do not leak into training.
         prev_training = unwrapped_model.training
+        temporary_kv_caches = []
         try:
             # Inference setup
             unwrapped_model.eval()
+            temporary_kv_caches = _ensure_inference_kv_caches(unwrapped_model)
             # unwrapped_model.to(torch.bfloat16)
             unwrapped_model.audio_vae = audio_vae.to(torch.float32)
 
@@ -646,6 +1023,7 @@ def generate_sample_audio(
         finally:
             # Always restore the training state, even if generation fails.
             try:
+                _clear_inference_kv_caches(temporary_kv_caches)
                 # unwrapped_model.to(torch.float32)
                 unwrapped_model.audio_vae = None
                 if prev_training:

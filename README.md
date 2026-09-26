@@ -147,6 +147,22 @@ Browser opens automatically. Model downloads on first run (~4-5 GB to `models/`)
 
 The app streams a log with each stage: ffmpeg extract → Parakeet transcription → segmentation → clip save → training. Final LoRA checkpoint lands in `lora/<name>/step_XXXX/` and is immediately available in the LoRA dropdown across all tabs.
 
+Choose the **GPU VRAM profile** before training. The choice changes execution
+memory only; it does not lower LoRA rank, alpha, or the requested learning
+quality:
+
+| Profile | Training behavior |
+|---|---|
+| 8 GB | batch 1, BF16 frozen backbone, activation checkpointing, 256-token sample cap |
+| 12 GB | batch 1, checkpointing, 384-token sample cap |
+| 16 GB | batch 1, no checkpointing, 512-token sample cap |
+| >16 GB — max speed | batch 2, no checkpointing and no artificial token cap |
+
+The WebUI unloads its inference and ASR models before starting the trainer.
+Oversized source clips are split with timestamp/transcript accounting instead
+of being silently discarded. Peak CUDA memory and controlled OOM diagnostics
+are written to the training log.
+
 ### Option B — Manual
 
 1. Prepare your clips (5-50 WAV/MP3, 3-15 sec each) + transcripts in `filename.wav|text` format, one per line
