@@ -1305,6 +1305,8 @@ def _detect_device() -> tuple[str, str]:
         name = torch.cuda.get_device_name(0)
         vram = torch.cuda.get_device_properties(0).total_memory / 1e9
         return "cuda", f"{name} | VRAM: {vram:.1f} GB"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps", "Apple GPU (MPS)"
     return "cpu", "CPU (экспериментально / experimental — very slow)"
 
 DEVICE, DEVICE_INFO = _detect_device()
@@ -1360,7 +1362,7 @@ def get_model(lora_weights_path: Optional[str] = None, force_reload: bool = Fals
                 print(f"[lora] loaded lora_config.json: r={cfg_data.get('r')}, alpha={cfg_data.get('alpha')}")
             except Exception as exc:
                 print(f"[lora] WARNING: failed to read lora_config.json: {exc}")
-    _model = VoxCPM.from_pretrained(model_path, **kwargs)
+    _model = VoxCPM.from_pretrained(model_path, device=DEVICE, **kwargs)
     print(f"[VoxCPM2] Model loaded. Sample rate: {_model.tts_model.sample_rate} Hz")
     return _model
 
@@ -1456,7 +1458,7 @@ def _save_wav(wav: np.ndarray, sr: int, prefix: str = "tts", fmt: str = "mp3") -
             "ogg": ["-codec:a", "libvorbis", "-q:a", "5"],
         }.get(fmt, [])
         subprocess.run(
-            ["ffmpeg", "-y", "-i", str(tmp_wav), *codec_args, str(out_path)],
+            [_ffmpeg_bin(), "-y", "-i", str(tmp_wav), *codec_args, str(out_path)],
             check=True, capture_output=True, timeout=60,
         )
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as exc:

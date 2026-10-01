@@ -21,5 +21,7 @@ datasets<4  # для prepare_test_dataset.py (скачать тестовый д
 
 # Авто-подготовка датасета из видео/аудио (Parakeet TDT 0.6B v3 INT8 ONNX)
 # Сама модель (~670 MB) качается лениво при первом клике на «Авто-подготовку»
-# [gpu,hub] — подтягивает onnxruntime-gpu и huggingface_hub автоматически
-onnx-asr[gpu,hub]>=0.5
+# CUDA is unavailable on macOS, so use the CPU ONNX Runtime there. Linux and
+# Windows retain the GPU extra used by the existing installers.
+onnx-asr[hub]>=0.5; sys_platform == "darwin"
+onnx-asr[gpu,hub]>=0.5; sys_platform != "darwin"

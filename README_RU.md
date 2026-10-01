@@ -4,7 +4,7 @@
 
 <img src="docs/hero.png" alt="VoxCPM2 Portable" width="600"/>
 
-**Портативная Windows-сборка VoxCPM2 — мультиязычный TTS с Voice Design, клонированием голоса и end-to-end тренировкой LoRA (видео/аудио → датасет → обучение).**
+**Кроссплатформенная portable-сборка VoxCPM2 — мультиязычный TTS с Voice Design, клонированием голоса и end-to-end тренировкой LoRA (видео/аудио → датасет → обучение).**
 
 [![Stars](https://img.shields.io/github/stars/timoncool/VoxCPM2_portable?style=flat-square)](https://github.com/timoncool/VoxCPM2_portable/stargazers)
 [![License](https://img.shields.io/github/license/timoncool/VoxCPM2_portable?style=flat-square)](LICENSE)
@@ -23,7 +23,7 @@
 >
 > Репозиторий лаунчера: **[timoncool/VoxCPM2_portable-pinokio](https://github.com/timoncool/VoxCPM2_portable-pinokio)**
 
-Синтезируй натуральную речь на 30 языках, создавай уникальные голоса из текстового описания, клонируй любой голос по короткому референсу и **тренируй свою LoRA прямо из видео или аудио-файла** — бросил 8-минутный подкаст в приложение, и оно само нарезает на клипы, транскрибирует, подбирает оптимальные параметры и запускает тренировку. **100% локально**, без облака, без API-ключей. Установка в один клик на Windows, работает на любой NVIDIA GPU с 8+ GB VRAM.
+Синтезируй натуральную речь на 30 языках, создавай уникальные голоса из текстового описания, клонируй любой голос по короткому референсу и **тренируй свою LoRA прямо из видео или аудио-файла** — бросил 8-минутный подкаст в приложение, и оно само нарезает на клипы, транскрибирует, подбирает оптимальные параметры и запускает тренировку. **100% локально**, без облака, без API-ключей. Установка в один клик на Windows, macOS и Linux.
 
 Построен на [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) от OpenBMB — токенайзер-свободной 2B модели TTS (diffusion autoregressive), обученной на 2M+ часов речи.
 
@@ -32,7 +32,7 @@
 - **Бесплатно навсегда** — без API-ключей, кредитов и лимитов
 - **Приватно** — твои голосовые данные никуда не уходят
 - **Портативно** — всё в одной папке, скопируй на флешку, удалил = деинсталлировал
-- **Один клик** — `install.bat` → `run.bat` → синтезируй
+- **Один клик** — `install.bat`/`install.sh` → `run.bat`/`run.sh` → синтезируй
 - **30 языков** — русский, английский, китайский, французский, немецкий, японский, корейский и другие
 - **Авто-датасет из видео/аудио** — загружаешь длинный файл, приложение делает ffmpeg → ASR → VAD → нарезку по предложениям → подбор параметров → обучение, всё само
 
@@ -83,7 +83,7 @@ CFG Scale · Inference Steps · Min/Max длина · Retry при плохой 
 ### Интерфейс
 - **i18n RU/EN** — кнопки RU/EN в шапке для мгновенного переключения
 - **Тёмная тема** с gradient header
-- **FFmpeg в комплекте** (для кодирования MP3/OGG)
+- **FFmpeg в комплекте на Windows**; macOS/Linux используют системный FFmpeg (для кодирования MP3/OGG)
 - **Автозагрузка** — VoxCPM2 (~4-5 GB) + пак голосов + ASR-модель (~670 MB, лениво) при первом использовании
 - **Auto-port, auto-browser** — открывается на `localhost` автоматически
 
@@ -92,6 +92,7 @@ CFG Scale · Inference Steps · Min/Max длина · Retry при плохой 
 |-----|:---:|:---:|:---:|:---:|:---:|
 | RTX 30xx / 40xx / 50xx | ✅ | ✅ | ✅ | ✅ | ✅ |
 | GTX 10xx / RTX 20xx | ❌ | ✅ | ✅ | ✅ | ✅ |
+| Apple Silicon (MPS) | ❌ | ✅ | ❌ | ❌ | CPU |
 
 ## Системные требования
 
@@ -100,10 +101,11 @@ CFG Scale · Inference Steps · Min/Max длина · Retry при плохой 
 | GPU VRAM | 8 GB | 12+ GB |
 | RAM | 16 GB | 32 GB |
 | Диск | 15 GB | 30 GB (с пакетами голосов и LoRA) |
-| ОС | Windows 10/11 | Windows 11 |
-| GPU | RTX 2080 / RTX 3060 | RTX 4070+ |
+| ОС | Windows 10/11, macOS 12.3+, Linux | Windows 11 или macOS на Apple Silicon |
+| GPU | RTX 2080 / RTX 3060 / Apple Silicon | RTX 4070+ или Apple Silicon с unified memory 16 GB+ |
 
 CPU-режим поддерживается, но **очень медленный** (минуты на фразу).
+На macOS Apple Silicon использует PyTorch MPS для TTS. Intel Mac работает через CPU и заметно медленнее; CUDA-пакеты (Triton, xformers и Flash Attention 2) не устанавливаются.
 
 ## Быстрый старт
 
@@ -113,25 +115,41 @@ git clone https://github.com/timoncool/VoxCPM2_portable.git
 cd VoxCPM2_portable
 ```
 
-### 2. Установи
+### 2. Установка на Windows
 ```
 install.bat
 ```
 Выбери тип GPU (6 вариантов). Устанавливает портативный Python 3.12 + PyTorch 2.7.1 + voxcpm + Flash Attention 2 + FFmpeg + onnx-asr + дефолтный пак голосов. Ничего в системе.
 
-### 3. Запусти
+### 2. Установка на macOS/Linux
+```bash
+chmod +x install.sh run.sh update.sh
+./install.sh
+```
+Скрипт создаёт локальный `.venv`, устанавливает PyTorch 2.7.1 и зависимости, а модели/кэш/результаты сохраняет в этой папке. На macOS установи [Homebrew](https://brew.sh/), если FFmpeg ещё не установлен; Apple Silicon автоматически использует MPS.
+
+### 3. Запуск на Windows
 ```
 run.bat
 ```
 Браузер откроется сам. Модель скачается при первом запуске (~4-5 GB в `models/`). Parakeet ASR (~670 MB) тянется только при первом клике на **Авто-подготовку**.
 
-## Батники
+### 3. Запуск на macOS/Linux
+```bash
+./run.sh
+```
+Браузер откроется сам. Для остановки нажми `Ctrl+C`.
+
+## Скрипты запуска
 
 | Скрипт | Описание |
 |--------|----------|
 | `install.bat` | Установщик в один клик — Python + PyTorch + voxcpm + ускорители + FFmpeg + onnx-asr + пак голосов |
 | `run.bat` | Запуск Gradio UI с полной изоляцией окружения |
 | `update.bat` | Обновление портативки + voxcpm package |
+| `install.sh` | Установщик macOS/Linux с локальным `.venv` и совместимыми зависимостями |
+| `run.sh` | Запуск macOS/Linux с изоляцией кэша и временных файлов |
+| `update.sh` | Обновление Git и Python-зависимостей на macOS/Linux |
 
 ## LoRA тренировка — полный гайд
 
@@ -186,11 +204,15 @@ VoxCPM2_portable/
 ├── install.bat         # Выбор GPU + установщик
 ├── run.bat             # Запуск с изоляцией окружения
 ├── update.bat          # Обновление
+├── install.sh          # Установщик macOS/Linux
+├── run.sh              # Запуск macOS/Linux
+├── update.sh            # Обновление macOS/Linux
 ├── requirements.txt    # Python-зависимости
 ├── training/
 │   ├── scripts/        # Официальные OpenBMB train & inference скрипты (встроены)
 │   └── conf/           # Шаблоны YAML-конфигов
 ├── python/             # Портативный Python 3.12 (создаётся install.bat)
+├── .venv/               # Локальное Python-окружение (создаётся install.sh)
 ├── models/             # HuggingFace кэш (VoxCPM2 ~4-5 GB, Parakeet ~670 MB, Silero VAD, …)
 ├── voices/             # Пак голосов (дефолтные ~100 + пользовательские)
 ├── lora/               # Обученные LoRA чекпоинты (lora/<имя>/step_XXXX/)
@@ -203,7 +225,8 @@ VoxCPM2_portable/
 ## Обновление
 
 ```
-update.bat
+update.bat                 # Windows
+./update.sh                # macOS/Linux
 ```
 
 ## Ссылки
