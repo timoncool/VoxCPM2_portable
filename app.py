@@ -105,6 +105,16 @@ ZIPENHANCER_REPO = "iic/speech_zipenhancer_ans_multiloss_16k_base"
 ZIPENHANCER_CACHE_DIR = Path(__file__).parent.absolute() / "models" / "zipenhancer"
 
 
+def _is_complete_voxcpm2_model(path: Path) -> bool:
+    """Return True only when the local VoxCPM2 folder has all weights needed for load/train."""
+    return (
+        path.exists()
+        and (path / "config.json").exists()
+        and ((path / "model.safetensors").exists() or (path / "pytorch_model.bin").exists())
+        and ((path / "audiovae.safetensors").exists() or (path / "audiovae.pth").exists())
+    )
+
+
 def _ensure_voxcpm2_local() -> str:
     """
     Ensure VoxCPM2 model is available locally (offline mode).
@@ -113,12 +123,8 @@ def _ensure_voxcpm2_local() -> str:
     """
     local_path = VOXCPM2_CACHE_DIR / "openbmb_VoxCPM2"
 
-    # Check if already cached locally (look for config.json or model.safetensors)
-    if local_path.exists() and (
-        (local_path / "config.json").exists() or 
-        (local_path / "model.safetensors").exists() or
-        (local_path / "pytorch_model.bin").exists()
-    ):
+    # Check if already cached locally with the full set of files needed by VoxCPM2Model.from_local().
+    if _is_complete_voxcpm2_model(local_path):
         print(f"[voxcpm2] Using local cache: {local_path}")
         return str(local_path)
 
@@ -134,7 +140,9 @@ def _ensure_voxcpm2_local() -> str:
             local_dir=str(local_path),
         )
         print(f"[voxcpm2] Downloaded via ModelScope: {downloaded_path}")
-        return downloaded_path
+        if _is_complete_voxcpm2_model(Path(downloaded_path)):
+            return downloaded_path
+        print(f"[voxcpm2] ModelScope download incomplete, missing model or AudioVAE weights in: {downloaded_path}")
     except ImportError:
         print("[voxcpm2] modelscope not installed. Run: pip install modelscope")
     except Exception as e:
@@ -149,7 +157,9 @@ def _ensure_voxcpm2_local() -> str:
             local_files_only=False,
         )
         print(f"[voxcpm2] Downloaded via HuggingFace: {downloaded_path}")
-        return downloaded_path
+        if _is_complete_voxcpm2_model(Path(downloaded_path)):
+            return downloaded_path
+        print(f"[voxcpm2] HuggingFace download incomplete, missing model or AudioVAE weights in: {downloaded_path}")
     except ImportError:
         print("[voxcpm2] huggingface_hub not installed.")
     except Exception as e:
@@ -159,7 +169,7 @@ def _ensure_voxcpm2_local() -> str:
     try:
         from modelscope.hub.utils.utils import get_cache_dir
         ms_cache = Path(get_cache_dir()) / "hub" / "openbmb_VoxCPM2"
-        if ms_cache.exists() and (ms_cache / "config.json").exists():
+        if _is_complete_voxcpm2_model(ms_cache):
             print(f"[voxcpm2] Found in ModelScope default cache, copying to {local_path}...")
             import shutil
             shutil.copytree(ms_cache, local_path, dirs_exist_ok=True)
@@ -1200,13 +1210,13 @@ def train_lora(name, files, transcripts, r, alpha, steps, lr, progress=gr.Progre
     save_path.mkdir(parents=True, exist_ok=True)
     config_path = TRAIN_DATA_DIR / name / "train_config.yaml"
 
-    # Путь к уже скачанному VoxCPM2 (в models/ через HF cache)
-    # Ищем snapshot
-    from huggingface_hub import snapshot_download
+    # Use the same complete local model folder as inference. HuggingFace cache
+    # snapshots can contain only config/tokenizer files and miss AudioVAE weights.
     try:
-        pretrained = snapshot_download("openbmb/VoxCPM2", local_files_only=True)
-    except Exception:
-        pretrained = snapshot_download("openbmb/VoxCPM2")
+        pretrained = _ensure_voxcpm2_local()
+    except Exception as exc:
+        yield f"❌ VoxCPM2 model is incomplete or unavailable: {exc}"
+        return
 
     # grad_accum адаптивный (общий для recommender и трена)
     n_files_for_config = len(files) if files else 20
