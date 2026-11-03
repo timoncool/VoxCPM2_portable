@@ -1,3 +1,6 @@
+> [!WARNING]
+> **This project is no longer developed.** Looking for multilingual text-to-speech, voice cloning or a voice from a description? They now live in **[Speech Studio](https://github.com/timoncool/speech-studio)**. It brings together the latest AI technology: text-to-speech with Higgs Audio v3, Fish Audio Drama 3, Qwen3-TTS and Supertonic 3, voice cloning, voice design from a description, audiobooks and podcasts, speech recognition with speaker separation on Parakeet, Nemotron and CrisperWhisper, and voice conversations with an AI agent. Free and offline, on Windows, macOS and Linux.
+
 <div align="center">
 
 # VoxCPM2 Portable
